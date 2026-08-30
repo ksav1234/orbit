@@ -59,7 +59,7 @@ What Orbit handles for you:
 ```bash
 npm install
 npm run build
-npm link          # optional: puts `orbit` on your PATH
+npm link          # RECOMMENDED TO ADD : put `orbit` on your PATH
 ```
 
 Or run it straight from the source tree:
