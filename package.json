@@ -1,0 +1,55 @@
+{
+  "name": "orbit-cli",
+  "version": "0.1.0",
+  "description": "Orbit — AI that works inside your workspace.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "orbit": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "agent",
+    "terminal",
+    "coding-agent",
+    "ink"
+  ],
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "cli-spinners": "^3.4.0",
+    "diff": "^8.0.4",
+    "ink": "^6.8.0",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^19.2.8",
+    "string-width": "^7.2.0",
+    "strip-ansi": "^7.2.0",
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "ink-testing-library": "^4.0.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
