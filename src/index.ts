@@ -8,7 +8,7 @@ import { App } from './cli/app.js';
 import { runConfigScreen, runProviderWizard } from './cli/setup.js';
 import { confirm, isInteractive, print, printError, table, ui } from './cli/prompt.js';
 import { loadConfig, type ConfigManager } from './config/manager.js';
-import { PROVIDER_PRESETS, presetById } from './config/schema.js';
+import { HOOK_EVENTS, PROVIDER_PRESETS, presetById } from './config/schema.js';
 import { createProvider } from './providers/factory.js';
 import type { AIProvider } from './providers/provider.js';
 import { PermissionManager } from './permissions/manager.js';
@@ -21,6 +21,15 @@ import { Agent } from './agent/agent.js';
 import { Planner, createPlanTool } from './agent/planner.js';
 import { AutoMode } from './agent/autopilot.js';
 import { UsageTracker } from './context/usage.js';
+import { HookRunner, describeHook, hookMatchesTool } from './hooks/runner.js';
+import {
+  WindowCache,
+  describeWindowSource,
+  detectWindow,
+  parseWindowArgument,
+  resolveWindow,
+  type WindowResolution,
+} from './context/window.js';
 import { SessionManager, newSessionRecord } from './sessions/manager.js';
 import { CheckpointManager } from './checkpoints/manager.js';
 import { BackgroundRegistry } from './tools/background.js';
@@ -58,6 +67,7 @@ const VALUE_FLAGS = new Set(['model', 'provider', 'prompt', 'output', 'theme']);
 
 const COMMANDS = new Set([
   'config',
+  'hooks',
   'provider',
   'model',
   'web',
@@ -108,6 +118,14 @@ export function parseArgs(argv: string[]): ParsedArgs {
       continue;
     }
 
+    // A leading minus followed by a digit is a negative value, not a flag
+    // bundle. `orbit model context -500k` has to reach the command as an
+    // argument, and `-5` is not a set of short flags under any reading.
+    if (/^-\d/.test(token)) {
+      positional.push(token);
+      continue;
+    }
+
     if (token.startsWith('-') && token.length > 1) {
       for (const [index, letter] of [...token.slice(1)].entries()) {
         const name = FLAG_ALIASES[letter] ?? letter;
@@ -151,7 +169,8 @@ function showHelp(): void {
   print('  orbit clear                  Delete stored sessions');
   print('  orbit web [key|on|off]       Web search access (Tavily)');
   print('  orbit mcp <cmd>              list | add <id> <cmd> | remove <id> | test [id]');
-  print('  orbit model context <n>      Set the context window explicitly');
+  print('  orbit hooks [test <n>]       Lifecycle hooks: list them, or try one out');
+  print('  orbit model context [<n>]    Show, resize (up/down/+50k), or re-detect the window');
   print();
   print(ui.title('Options'));
   print('  -m, --model <model>          Use a specific model for this run');
@@ -348,42 +367,132 @@ async function modelCommand(config: ConfigManager, args: string[]): Promise<numb
     return 0;
   }
 
-  // Context windows are guessed from the model name and refined by the
-  // provider's /models endpoint. When neither is right — a large-context
-  // deployment, a self-hosted build — this sets it explicitly.
+  // The window is asked of the provider first and only guessed from the model
+  // name as a last resort. This command reports which of those happened, and
+  // lets the user override it when neither is right.
   if (action === 'context') {
-    if (!target) {
-      const current = provider.contextWindow;
+    const activeModel = provider.model ?? provider.models[0] ?? '';
+    const cache = await WindowCache.load();
+    const preset = presetById(provider.id)?.contextWindow;
+
+    const resolve = (explicit?: number): WindowResolution =>
+      resolveWindow({ providerId: provider.id, model: activeModel, explicit, preset, cache });
+
+    /** Ask the provider directly. Returns undefined when it will not say. */
+    const askProvider = async (): Promise<WindowResolution | undefined> => {
+      try {
+        const instance = createProvider({
+          config: { ...provider, contextWindow: undefined },
+          apiKey: config.apiKey(provider.id),
+          model: activeModel,
+        });
+        const found = await detectWindow({
+          provider: instance,
+          providerId: provider.id,
+          model: activeModel,
+          cache,
+          allowProbe: config.get().optimizer.probeWindow,
+        });
+        await cache.save();
+        return found;
+      } catch (error) {
+        print(ui.dim(`Could not reach ${provider.label} (${errorMessage(error)}).`));
+        return undefined;
+      }
+    };
+
+    const report = (resolved: WindowResolution): void => {
       print();
+      print(`  ${ui.label('Model')}           ${ui.value(activeModel || 'none selected')}`);
       print(
-        `  ${ui.label('Context window')}  ${ui.value(
-          current ? `${current.toLocaleString()} tokens (set explicitly)` : 'auto-detected from the model name',
+        `  ${ui.label('Context window')}  ${ui.value(`${resolved.tokens.toLocaleString()} tokens`)}  ${ui.dim(
+          `(${describeWindowSource(resolved.source, provider.label)})`,
         )}`,
       );
-      print(ui.dim('  Set with: orbit model context <tokens>   ·   reset with: orbit model context auto'));
+      if (resolved.source === 'name' || resolved.source === 'preset') {
+        print();
+        print(ui.dim(`  ${provider.label} would not say what ${activeModel}'s window is, so this is`));
+        print(ui.dim('  a fallback. If you know the real figure, set it and Orbit will use it.'));
+      }
       print();
+      print(ui.dim('  Set with:       orbit model context <tokens>'));
+      print(ui.dim('  Ask again with: orbit model context detect'));
+      print(ui.dim('  Clear an override: orbit model context auto'));
+      print();
+    };
+
+    // No argument: show what is in force. Nothing authoritative is known yet,
+    // so ask the provider rather than telling the user to run a second command.
+    if (!target) {
+      let resolved = resolve(provider.contextWindow);
+      if (
+        (resolved.source === 'name' || resolved.source === 'preset') &&
+        config.get().optimizer.autoDetectWindow &&
+        activeModel
+      ) {
+        print(ui.dim(`Asking ${provider.label} about ${activeModel}…`));
+        resolved = (await askProvider()) ?? resolved;
+      }
+      report(resolved);
       return 0;
     }
 
-    if (target === 'auto') {
-      await config.update((draft) => {
-        const entry = draft.providers[provider.id];
-        if (entry) delete entry.contextWindow;
-      });
-      print(ui.ok('Context window will be detected automatically.'));
+    if (target === 'auto' || target === 'detect') {
+      if (provider.contextWindow !== undefined) {
+        await config.update((draft) => {
+          const entry = draft.providers[provider.id];
+          if (entry) delete entry.contextWindow;
+        });
+        print(ui.ok('Override cleared.'));
+      }
+      // `detect` also discards what the provider said last time, so a model
+      // whose window changed server-side is picked up.
+      if (target === 'detect') cache.forget(provider.id, activeModel);
+
+      const found = activeModel ? await askProvider() : undefined;
+      if (found) {
+        print(
+          ui.ok(
+            `${provider.label} reports ${found.tokens.toLocaleString()} tokens for ${activeModel}.`,
+          ),
+        );
+      }
+      report(found ?? resolve());
       return 0;
     }
 
-    const tokens = Number.parseInt(target.replace(/[_,]/g, ''), 10);
-    if (!Number.isInteger(tokens) || tokens < 1024) {
-      printError(ui.error('Usage: orbit model context <tokens>   (e.g. 1000000)'));
+    // `up`/`down` step the ladder, `+N`/`-N` nudge, a bare number sets it.
+    // All three are relative to whatever is in force right now, detected or not.
+    const inForce = resolve(provider.contextWindow).tokens;
+    const tokens = parseWindowArgument(target, inForce);
+    if (tokens === undefined) {
+      printError(ui.error(`Cannot use "${target}" as a context window.`));
+      print(ui.dim('  It must parse to a number of tokens between 1,024 and 50,000,000.'));
+      print();
+      print(ui.dim('  orbit model context 1000000     an exact number (1m and 128k also work)'));
+      print(ui.dim('  orbit model context up          one step larger'));
+      print(ui.dim('  orbit model context down        one step smaller'));
+      print(ui.dim('  orbit model context +50000      relative to the current window'));
+      print(ui.dim('  orbit model context detect      ask the provider'));
+      print(ui.dim('  orbit model context auto        drop the override'));
       return 1;
     }
+
+    if (tokens === inForce) {
+      print(ui.ok(`Already at ${tokens.toLocaleString()} tokens.`));
+      return 0;
+    }
+
     await config.update((draft) => {
       const entry = draft.providers[provider.id];
       if (entry) entry.contextWindow = tokens;
     });
-    print(ui.ok(`Context window for ${provider.label} set to ${tokens.toLocaleString()} tokens.`));
+    const direction = tokens > inForce ? 'Raised' : 'Lowered';
+    print(
+      ui.ok(
+        `${direction} ${provider.label}'s context window: ${inForce.toLocaleString()} → ${tokens.toLocaleString()} tokens.`,
+      ),
+    );
     print(
       ui.dim(
         '  The optimizer will scale reply and tool budgets to match. If the provider rejects requests, lower it.',
@@ -618,6 +727,24 @@ interface StartOptions {
   unicodeMode: 'auto' | 'off';
 }
 
+/**
+ * Resolve with the promise's value if it settles in time, otherwise
+ * `undefined`. The promise is left running — the caller decides what to do
+ * with a late answer — so nothing is cancelled or lost.
+ */
+async function settleWithin<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function startInteractive(options: StartOptions): Promise<number> {
   const { config, sessions } = options;
 
@@ -648,6 +775,55 @@ async function startInteractive(options: StartOptions): Promise<number> {
     reportStartupError(error);
     return 1;
   }
+
+  // ── context window ──
+  // The window drives every budget in the session, so it is worth asking the
+  // provider rather than inferring it from the model name. Detection starts
+  // here and is collected just before the UI mounts, so it overlaps with the
+  // rest of startup (MCP servers, git state) and usually costs nothing.
+  const windowCache = await WindowCache.load();
+  const windowFor = (target: AIProvider, targetModel: string): WindowResolution =>
+    resolveWindow({
+      providerId: target.id,
+      model: targetModel,
+      explicit: config.getProvider(target.id)?.contextWindow,
+      preset: presetById(target.id)?.contextWindow,
+      cache: windowCache,
+    });
+
+  /**
+   * Ask the provider for a model's real window. Skipped entirely when the user
+   * has set one explicitly — their number is not something to second-guess.
+   */
+  const detectWindowFor = async (
+    target: AIProvider,
+    targetModel: string,
+  ): Promise<WindowResolution | undefined> => {
+    const optimizer = config.get().optimizer;
+    if (!optimizer.autoDetectWindow) return undefined;
+    if (config.getProvider(target.id)?.contextWindow) return undefined;
+
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 15_000);
+    try {
+      const found = await detectWindow({
+        provider: target,
+        providerId: target.id,
+        model: targetModel,
+        cache: windowCache,
+        allowProbe: optimizer.probeWindow,
+        signal: abort.signal,
+      });
+      await windowCache.save();
+      return found;
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const detection = detectWindowFor(provider, model);
 
   // ── workspace ──
   const sandbox = new Sandbox({
@@ -682,6 +858,10 @@ async function startInteractive(options: StartOptions): Promise<number> {
   });
   const usageTracker = new UsageTracker();
   await usageTracker.load();
+
+  // Hooks come from the user's own config only — never from the workspace —
+  // so opening a cloned repository cannot run anything.
+  const hooks = new HookRunner(config.get().hooks);
 
   const runtimeConfig = config.get();
   if (options.optimize === false) runtimeConfig.optimizer.enabled = false;
@@ -759,8 +939,60 @@ async function startInteractive(options: StartOptions): Promise<number> {
     checkpoints,
     background,
     webApiKey: webKey,
+    resolveWindow: windowFor,
+    detectWindow: detectWindowFor,
+    hooks,
   });
   await agent.initialize();
+
+  // Collect detection with a short budget: a wrong window costs quality all
+  // session, but a slow launch is felt immediately. Anything that arrives
+  // later is applied to the live session instead.
+  const detected = await settleWithin(detection, 2500);
+  if (detected) {
+    agent.applyContextWindow(detected);
+  } else {
+    void detection.then((late) => {
+      if (late) agent.applyContextWindow(late);
+    });
+  }
+
+  // Hook output goes to stderr so it cannot be confused with Orbit's own
+  // reporting, and so `--print` stdout stays machine-readable.
+  hooks.onOutcome((outcome) => {
+    const label = describeHook(outcome.hook);
+    if (outcome.error) {
+      printError(ui.warn(`Hook "${label}" could not run: ${outcome.error}`));
+      return;
+    }
+    if (outcome.timedOut) {
+      printError(ui.warn(`Hook "${label}" timed out after ${outcome.hook.timeoutMs}ms.`));
+      return;
+    }
+    if (outcome.code !== 0) {
+      printError(ui.warn(`Hook "${label}" exited ${String(outcome.code)}.`));
+    }
+    if (outcome.output && (outcome.hook.showOutput || outcome.code !== 0)) {
+      for (const line of outcome.output.split('\n').slice(0, 20)) {
+        printError(ui.dim(`  ${line}`));
+      }
+    }
+  });
+
+  if (hooks.count() > 0) {
+    warnings.push(
+      `${pluralize(hooks.count(), 'lifecycle hook')} configured. Review them with: orbit hooks`,
+    );
+  }
+  await agent.runHooks('session-start');
+
+  const activeWindow = agent.context.getContextWindow();
+  if (agent.contextWindowSource() === 'name') {
+    // Stated plainly: the budget is a guess, and there is a command to fix it.
+    warnings.push(
+      `Context window assumed to be ${activeWindow.toLocaleString()} tokens (${providerConfig.label} did not say). Run: orbit model context`,
+    );
+  }
 
   if (runtimeConfig.web.enabled && !webKey) {
     warnings.push('Web search is configured but has no Tavily key. Run: orbit web key');
@@ -791,6 +1023,9 @@ async function startInteractive(options: StartOptions): Promise<number> {
       verbose: options.headless.verbose,
       autoApprove: options.headless.autoApprove,
     });
+    // Headless runs get the same lifecycle as interactive ones — running tests
+    // after an agent edit is exactly what a scripted run is for.
+    await agent.runHooks('session-end');
     await agent.persist();
     await usageTracker.save();
     background.stopAll();
@@ -855,6 +1090,7 @@ async function startInteractive(options: StartOptions): Promise<number> {
   );
 
   await instance.waitUntilExit();
+  await agent.runHooks('session-end');
   await agent.persist();
   await usageTracker.save();
   // Nothing Orbit started outlives Orbit.
@@ -862,6 +1098,139 @@ async function startInteractive(options: StartOptions): Promise<number> {
   if (stopped > 0) print(ui.dim(`Stopped ${stopped} background process(es).`));
   await stopMcpServers(mcp.clients);
   return 0;
+}
+
+/**
+ * Inspect and try out lifecycle hooks.
+ *
+ * There is deliberately no `hooks add`: a hook is a shell command that Orbit
+ * will run on your behalf, so it should be written into `~/.orbit/config.json`
+ * deliberately rather than assembled from command-line arguments.
+ */
+async function hooksCommand(config: ConfigManager, args: string[]): Promise<number> {
+  const [action, target] = args;
+  const hooksConfig = config.get().hooks;
+  const entries = hooksConfig.entries;
+
+  if (!action || action === 'list') {
+    print();
+    print(ui.title(`Hooks  ${ui.dim(hooksConfig.enabled ? '' : '(all disabled)')}`));
+    print();
+
+    if (entries.length === 0) {
+      print(ui.dim('  None configured.'));
+      print();
+      print(ui.dim(`  Hooks live under "hooks" in ${tildify(orbitPaths.config)}:`));
+      print();
+      print(ui.dim('    "hooks": {'));
+      print(ui.dim('      "entries": ['));
+      print(ui.dim('        {'));
+      print(ui.dim('          "name": "format",'));
+      print(ui.dim('          "on": "post-tool",'));
+      print(ui.dim('          "tools": ["write_file", "edit_file"],'));
+      print(ui.dim('          "command": "npx prettier --write \\"$ORBIT_FILE\\""'));
+      print(ui.dim('        },'));
+      print(ui.dim('        { "name": "test", "on": "turn-end", "command": "npm test", "showOutput": true }'));
+      print(ui.dim('      ]'));
+      print(ui.dim('    }'));
+      print();
+      print(ui.dim(`  Events: ${HOOK_EVENTS.join(', ')}`));
+      print();
+      return 0;
+    }
+
+    for (const [index, hook] of entries.entries()) {
+      const marker = hook.enabled && hooksConfig.enabled ? ui.accent('●') : ui.dim('○');
+      const flags: string[] = [];
+      if (hook.tools.length > 0) flags.push(hook.tools.join(', '));
+      if (hook.blocking) flags.push('blocking');
+      if (hook.showOutput) flags.push('shows output');
+      if (!hook.enabled) flags.push('disabled');
+
+      print(`  ${marker} ${String(index + 1).padStart(2)}. ${ui.value(describeHook(hook))}`);
+      print(`       ${ui.dim(hook.on)}  ${ui.dim(hook.command)}`);
+      if (flags.length > 0) print(`       ${ui.dim(flags.join('  ·  '))}`);
+    }
+    print();
+    print(ui.dim('  Try one with: orbit hooks test <number>'));
+    print();
+    return 0;
+  }
+
+  if (action === 'test') {
+    const index = Number.parseInt(target ?? '', 10) - 1;
+    const hook = entries[index];
+    if (!hook) {
+      printError(ui.error(`No hook ${target ?? ''}. Run: orbit hooks list`));
+      return 1;
+    }
+
+    // A tool hook needs a tool name to match against. The third argument wins;
+    // otherwise pick a real tool the hook's matcher accepts — a regex entry is
+    // a pattern, not a name, so it cannot stand in for one.
+    const isToolHook = hook.on === 'pre-tool' || hook.on === 'post-tool';
+    let tool = args[2];
+    if (isToolHook && !tool) {
+      const available = buildToolRegistry({})
+        .definitions()
+        .map((definition) => definition.name);
+      tool = available.find((name) => hookMatchesTool(hook, name));
+      if (!tool) {
+        printError(ui.error(`No tool matches ${hook.tools.join(', ')}, so this hook can never run.`));
+        print(ui.dim('  Name a tool explicitly to test anyway: orbit hooks test <n> <tool>'));
+        return 1;
+      }
+    }
+
+    print(ui.dim(`Running "${describeHook(hook)}"${tool ? ` against ${tool}` : ''}…`));
+    const runner = new HookRunner({ enabled: true, entries: [{ ...hook, enabled: true }] });
+    const outcomes = await runner.run(hook.on, {
+      event: hook.on,
+      workspace: process.cwd(),
+      sessionId: 'hook-test',
+      model: config.activeProvider()?.model ?? 'none',
+      provider: config.activeProvider()?.label ?? 'none',
+      // Stand-ins so a tool hook has something to act on without a real call.
+      ...(isToolHook && tool
+        ? { tool, file: path.join(process.cwd(), 'example.txt'), ok: true }
+        : {}),
+    });
+
+    const outcome = outcomes[0];
+    if (!outcome) {
+      printError(
+        ui.error(
+          tool
+            ? `The hook's tool filter (${hook.tools.join(', ')}) does not match "${tool}", so nothing ran.`
+            : 'The hook did not match its own event, so nothing ran.',
+        ),
+      );
+      return 1;
+    }
+    print();
+    if (outcome.output) print(outcome.output);
+    print();
+    if (outcome.error) {
+      printError(ui.error(`Could not run it: ${outcome.error}`));
+      return 1;
+    }
+    if (outcome.timedOut) {
+      printError(ui.error(`Timed out after ${hook.timeoutMs}ms.`));
+      return 1;
+    }
+    if (outcome.code === 0) {
+      print(ui.ok(`Exited 0 in ${outcome.durationMs}ms.`));
+      return 0;
+    }
+    printError(ui.warn(`Exited ${String(outcome.code)} in ${outcome.durationMs}ms.`));
+    if (hook.blocking && hook.on === 'pre-tool') {
+      print(ui.dim('  As a blocking pre-tool hook, that would refuse the tool call.'));
+    }
+    return 1;
+  }
+
+  printError(ui.error(`Unknown hooks command "${action}". Try: list, test <number>.`));
+  return 1;
 }
 
 function reportStartupError(error: unknown): void {
@@ -948,6 +1317,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return modelCommand(config, positional);
     case 'web':
       return webCommand(config, positional);
+    case 'hooks':
+      return hooksCommand(config, positional);
     case 'mcp':
       return mcpCommand(config, positional);
     case 'sessions':

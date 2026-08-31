@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { PermissionManager } from '../src/permissions/manager.js';
 import { Sandbox } from '../src/permissions/sandbox.js';
+import type { CheckpointManager } from '../src/checkpoints/manager.js';
 import { ToolsConfigSchema, PermissionPolicySchema } from '../src/config/schema.js';
 import type { ToolContext } from '../src/tools/registry.js';
 
@@ -29,6 +30,8 @@ export interface TestContextOptions {
   signal?: AbortSignal;
   visionAvailable?: boolean;
   progress?: (message: string) => void;
+  /** Attach a real checkpoint manager to exercise undo through the tools. */
+  checkpoints?: CheckpointManager;
 }
 
 export function makeToolContext(options: TestContextOptions): ToolContext {
@@ -48,6 +51,7 @@ export function makeToolContext(options: TestContextOptions): ToolContext {
     signal: options.signal ?? new AbortController().signal,
     progress: options.progress ?? (() => {}),
     visionAvailable: options.visionAvailable ?? false,
+    ...(options.checkpoints ? { checkpoints: options.checkpoints } : {}),
   };
 }
 

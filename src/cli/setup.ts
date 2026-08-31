@@ -9,8 +9,18 @@ import {
 import { createProvider, isLocalEndpoint } from '../providers/factory.js';
 import { maskKey } from '../util/redact.js';
 import { formatCount } from '../util/format.js';
+import {
+  WindowCache,
+  describeWindowSource,
+  parseWindowArgument,
+  resolveWindow,
+  stepWindow,
+} from '../context/window.js';
 import { UsageTracker } from '../context/usage.js';
 import { errorMessage } from '../util/errors.js';
+import { describeHook } from '../hooks/runner.js';
+import { orbitPaths, tildify } from '../util/paths.js';
+import { pluralize } from '../util/format.js';
 import { ask, askSecret, confirm, print, printError, select, table, ui } from './prompt.js';
 import { ORBIT_LOGO_SMALL, TAGLINE } from '../ui/theme.js';
 
@@ -128,17 +138,31 @@ export async function runProviderWizard(
         : await ask('Model id', models[0]);
   }
 
-  const contextWindow = reportedWindows.get(model) ?? preset.contextWindow;
+  // A window the provider reported goes in the detection cache, not into the
+  // provider config: `contextWindow` there means "the user chose this", and
+  // freezing one model's window would stop the next model being detected.
+  const reported = reportedWindows.get(model);
+  const cache = await WindowCache.load();
+  if (reported) {
+    cache.record(provider.id, model, { tokens: reported, source: 'reported' });
+    await cache.save();
+  }
 
   const finalProvider: ProviderConfig = {
     ...provider,
     model,
     models: models.slice(0, 60),
-    ...(contextWindow ? { contextWindow } : {}),
   };
 
   await config.addProvider(finalProvider, apiKey || undefined);
   await config.useProvider(finalProvider.id);
+
+  const window = resolveWindow({
+    providerId: finalProvider.id,
+    model,
+    preset: preset.contextWindow,
+    cache,
+  });
 
   print();
   print(ui.ok(`Configured ${finalProvider.label}.`));
@@ -148,9 +172,7 @@ export async function runProviderWizard(
     ['Model', model],
     [
       'Context',
-      contextWindow
-        ? `${contextWindow.toLocaleString()} tokens${reportedWindows.has(model) ? ' (reported by the provider)' : ''}`
-        : 'detected from the model name',
+      `${window.tokens.toLocaleString()} tokens (${describeWindowSource(window.source, finalProvider.label)})`,
     ],
     [
       'API key',
@@ -289,7 +311,11 @@ async function runConfigScreenOnce(config: ConfigManager): Promise<boolean> {
     { value: 'active', label: 'Switch the active provider', description: 'Choose from configured providers' },
     { value: 'model', label: 'Change the model' },
     { value: 'key', label: 'Change the API key', description: 'Hidden input, for the active provider' },
-    { value: 'context', label: 'Set the context window', description: 'Override the detected size' },
+    {
+      value: 'context',
+      label: 'Context window',
+      description: 'Increase, decrease, or set the size every budget derives from',
+    },
     { value: 'permissions', label: 'Change workspace permissions' },
     { value: 'agent', label: 'Agent behaviour', description: 'Temperature, iteration limit, compaction' },
     { value: 'optimizer', label: 'Token optimization', description: 'Adaptive reply budget and tool output limits' },
@@ -297,6 +323,11 @@ async function runConfigScreenOnce(config: ConfigManager): Promise<boolean> {
     { value: 'web', label: 'Web access', description: 'Tavily API key for web_search and web_fetch' },
     { value: 'checkpoints', label: 'Checkpoints and undo' },
     { value: 'subagents', label: 'Sub-agents', description: 'Delegated investigations with their own context' },
+    {
+      value: 'hooks',
+      label: 'Lifecycle hooks',
+      description: 'Commands Orbit runs on writes, turns and session start/end',
+    },
     { value: 'theme', label: 'Colour theme' },
     { value: 'pricing', label: 'Model pricing', description: 'For cost estimates in /usage' },
     { value: 'usage', label: 'Reset token usage statistics' },
@@ -407,11 +438,28 @@ async function runConfigScreenOnce(config: ConfigManager): Promise<boolean> {
         announce = await confirm('Tell me when the budget changes?', announce);
       }
 
+      print();
+      print(ui.dim('  The window every budget is derived from is asked of the provider,'));
+      print(ui.dim('  cached per model, and only guessed from the model name as a last resort.'));
+      const autoDetectWindow = await confirm(
+        "Ask the provider for the model's real context window?",
+        current.optimizer.autoDetectWindow,
+      );
+      let probeWindow = current.optimizer.probeWindow;
+      if (autoDetectWindow) {
+        probeWindow = await confirm(
+          'When its model list is silent, make it name the limit in an error? (no tokens generated)',
+          probeWindow,
+        );
+      }
+
       await config.update((draft) => {
         draft.optimizer.enabled = enabled;
         draft.optimizer.targetUtilization = target;
         draft.optimizer.maxResponseTokens = maxResponse;
         draft.optimizer.announce = announce;
+        draft.optimizer.autoDetectWindow = autoDetectWindow;
+        draft.optimizer.probeWindow = probeWindow;
       });
       print(ui.ok(`Token optimization ${enabled ? 'enabled' : 'disabled'}.`));
       break;
@@ -489,25 +537,134 @@ async function runConfigScreenOnce(config: ConfigManager): Promise<boolean> {
         printError(ui.warn('Configure a provider first.'));
         break;
       }
+      const activeModel = active.model ?? active.models[0] ?? '';
+      const cache = await WindowCache.load();
+      const current = () =>
+        resolveWindow({
+          providerId: active.id,
+          model: activeModel,
+          explicit: config.getProvider(active.id)?.contextWindow,
+          preset: presetById(active.id)?.contextWindow,
+          cache,
+        });
+
+      /** Persist an explicit size, or clear the override when given nothing. */
+      const apply = async (tokens?: number): Promise<void> => {
+        await config.update((draft) => {
+          const entry = draft.providers[active.id];
+          if (!entry) return;
+          if (tokens === undefined) delete entry.contextWindow;
+          else entry.contextWindow = tokens;
+        });
+      };
+
+      // A loop, so stepping up three rungs does not mean re-entering the
+      // screen three times.
+      for (;;) {
+        const inForce = current();
+        print();
+        print(
+          `  ${ui.label('Context window')}  ${ui.value(`${inForce.tokens.toLocaleString()} tokens`)}  ${ui.dim(
+            `(${describeWindowSource(inForce.source, active.label)})`,
+          )}`,
+        );
+        print(ui.dim(`  ${activeModel || 'no model selected'} on ${active.label}`));
+        print();
+
+        const larger = stepWindow(inForce.tokens, 'up');
+        const smaller = stepWindow(inForce.tokens, 'down');
+
+        const choice = await select('Adjust', [
+          {
+            value: 'up',
+            label: `Increase  →  ${larger.toLocaleString()} tokens`,
+            description: 'One step larger. More room for files and history.',
+          },
+          {
+            value: 'down',
+            label: `Decrease  →  ${smaller.toLocaleString()} tokens`,
+            description: 'One step smaller. Use if the provider rejects requests as too long.',
+          },
+          {
+            value: 'exact',
+            label: 'Enter an exact number',
+            description: 'When you know what your deployment serves.',
+          },
+          {
+            value: 'detect',
+            label: `Ask ${active.label}`,
+            description: 'Drop the override and use what the provider reports.',
+          },
+          { value: 'done', label: 'Done', description: 'Keep the current window.' },
+        ]);
+
+        if (choice === 'done') break;
+
+        if (choice === 'detect') {
+          await apply(undefined);
+          cache.forget(active.id, activeModel);
+          print(ui.ok('Override cleared — the provider will be asked at the next launch.'));
+          break;
+        }
+
+        if (choice === 'exact') {
+          const answer = await ask('Context window in tokens', String(inForce.tokens));
+          const tokens = parseWindowArgument(answer, inForce.tokens);
+          if (tokens === undefined) {
+            printError(ui.warn('That is not a usable window (1,024 to 50,000,000 tokens).'));
+            continue;
+          }
+          await apply(tokens);
+          print(ui.ok(`Context window set to ${tokens.toLocaleString()} tokens.`));
+          continue;
+        }
+
+        const next = choice === 'up' ? larger : smaller;
+        if (next === inForce.tokens) {
+          print(ui.dim(`  Already at the ${choice === 'up' ? 'largest' : 'smallest'} step.`));
+          continue;
+        }
+        await apply(next);
+        print(
+          ui.ok(
+            `${choice === 'up' ? 'Increased' : 'Decreased'} to ${next.toLocaleString()} tokens.`,
+          ),
+        );
+      }
+
+      print(
+        ui.dim('  Reply, tool-output and compaction budgets all scale with this number.'),
+      );
+      break;
+    }
+
+    case 'hooks': {
+      const hooksConfig = current.hooks;
       print();
-      print(ui.dim(`  Orbit detects the window from the model name and the provider's model list.`));
-      print(ui.dim('  Override it here if your deployment serves a different size.'));
+      if (hooksConfig.entries.length === 0) {
+        print(ui.dim('  No hooks configured.'));
+        print(ui.dim(`  They are written by hand in ${tildify(orbitPaths.config)} — see: orbit hooks`));
+        print();
+        break;
+      }
+
+      for (const entry of hooksConfig.entries) {
+        const marker = entry.enabled ? ui.accent('●') : ui.dim('○');
+        print(`  ${marker} ${ui.value(describeHook(entry))}  ${ui.dim(entry.on)}`);
+      }
       print();
-      const answer = await ask(
-        'Context window in tokens ("auto" to detect)',
-        active.contextWindow ? String(active.contextWindow) : 'auto',
+
+      // Editing a command here would mean typing a shell line into a prompt;
+      // the config file is the honest place for that. This is just the switch.
+      const enabled = await confirm(
+        `Run these ${pluralize(hooksConfig.entries.length, 'hook')}?`,
+        hooksConfig.enabled,
       );
       await config.update((draft) => {
-        const entry = draft.providers[active.id];
-        if (!entry) return;
-        if (answer.trim().toLowerCase() === 'auto') {
-          delete entry.contextWindow;
-          return;
-        }
-        const tokens = Number.parseInt(answer.replace(/[_,]/g, ''), 10);
-        if (Number.isInteger(tokens) && tokens >= 1024) entry.contextWindow = tokens;
+        draft.hooks.enabled = enabled;
       });
-      print(ui.ok('Context window updated.'));
+      print(ui.ok(`Hooks ${enabled ? 'enabled' : 'disabled'}.`));
+      print(ui.dim('  Add or change them in the config file, then: orbit hooks test <n>'));
       break;
     }
 
@@ -554,8 +711,18 @@ async function runConfigScreenOnce(config: ConfigManager): Promise<boolean> {
       const maxPerSession = Number(
         await ask('Turns kept per session', String(current.checkpoints.maxPerSession)),
       );
+
+      let shellCommands = current.checkpoints.shellCommands;
+      if (enabled) {
+        print();
+        print(ui.dim('  Shell commands can change anything, so covering them means capturing'));
+        print(ui.dim('  the whole work tree around each one — about 100ms, and git-only.'));
+        shellCommands = await confirm('Also make shell commands undoable?', shellCommands);
+      }
+
       await config.update((draft) => {
         draft.checkpoints.enabled = enabled;
+        draft.checkpoints.shellCommands = shellCommands;
         if (Number.isInteger(maxPerSession) && maxPerSession > 0) {
           draft.checkpoints.maxPerSession = Math.min(500, maxPerSession);
         }

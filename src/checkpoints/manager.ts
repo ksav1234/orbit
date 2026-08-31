@@ -7,8 +7,17 @@ import { writeFileAtomic } from '../config/manager.js';
 import { createLogger } from '../util/logger.js';
 import { formatBytes } from '../util/format.js';
 import type { CheckpointsConfig } from '../config/schema.js';
+import { diffTrees, isGitWorkTree, readTreeFile, snapshotWorkTree } from './worktree.js';
 
 const log = createLogger('checkpoints');
+
+/**
+ * Ceiling on files recorded from a single shell command. A command that
+ * rewrites thousands of files (a codegen run, a mass rename) would otherwise
+ * turn one undo into a multi-gigabyte snapshot. Past this, the checkpoint keeps
+ * what it has and says so in the log rather than silently truncating.
+ */
+const MAX_EXTERNAL_FILES = 400;
 
 /** What happened to one file inside a turn. */
 export type FileChangeKind = 'created' | 'modified' | 'deleted' | 'moved';
@@ -82,6 +91,8 @@ export class CheckpointManager {
   /** Files captured for the turn currently in progress. */
   private pending = new Map<string, FileSnapshot>();
   private turnCounter = 0;
+  /** Cached: whether the workspace is a git work tree at all. */
+  private gitAvailable: boolean | undefined;
   private loaded = false;
 
   constructor(options: {
@@ -177,6 +188,120 @@ export class CheckpointManager {
       ...(skipped ? { skipped } : {}),
       bytes,
     });
+  }
+
+  /**
+   * Record a file's previous contents when they came from somewhere other than
+   * the file itself — specifically, from a git snapshot taken before a shell
+   * command ran. By then the file on disk is already changed, so `capture()`
+   * would save the *new* contents and undo would be a no-op.
+   *
+   * `before` is null when the change created the file, so undoing means
+   * deleting it again.
+   */
+  async captureContent(
+    absolutePath: string,
+    kind: FileChangeKind,
+    before: Buffer | null,
+    note?: string,
+  ): Promise<void> {
+    if (!this.config.enabled) return;
+
+    const relative = this.relativize(absolutePath);
+    // A tool already announced this file, and its capture came from before the
+    // turn started — earlier, and therefore better.
+    if (this.pending.has(relative)) return;
+
+    let beforeRef: string | null = null;
+    let skipped = note;
+    if (before) {
+      if (before.length > this.config.maxFileBytes) {
+        skipped = `larger than ${formatBytes(this.config.maxFileBytes)}`;
+      } else {
+        beforeRef = await this.storeBlob(before);
+      }
+    }
+
+    this.pending.set(relative, {
+      path: relative,
+      kind,
+      beforeRef,
+      ...(skipped ? { skipped } : {}),
+      bytes: before?.length ?? 0,
+    });
+  }
+
+  // ── external changes (shell commands) ────────────────────────────────────
+
+  /**
+   * Take a snapshot of the working tree before something Orbit cannot inspect
+   * runs. Returns a token to hand back to `recordExternalChanges`, or undefined
+   * when there is nothing to snapshot against (no git repo, or the feature is
+   * switched off) — in which case the caller simply does nothing afterwards.
+   */
+  async beginExternalChange(): Promise<string | undefined> {
+    if (!this.config.enabled || !this.config.shellCommands) return undefined;
+    if (this.gitAvailable === undefined) {
+      this.gitAvailable = await isGitWorkTree(this.workspaceRoot);
+      if (!this.gitAvailable) {
+        log.debug('shell checkpoints need a git work tree; not one here');
+      }
+    }
+    if (!this.gitAvailable) return undefined;
+    return snapshotWorkTree(this.workspaceRoot);
+  }
+
+  /**
+   * Compare the working tree against a snapshot and record whatever changed, so
+   * the turn can be undone. Returns the number of files recorded.
+   */
+  async recordExternalChanges(before: string | undefined): Promise<number> {
+    if (!before || !this.config.enabled) return 0;
+
+    const after = await snapshotWorkTree(this.workspaceRoot);
+    if (!after || after === before) return 0;
+
+    const changes = await diffTrees(this.workspaceRoot, before, after);
+    let recorded = 0;
+
+    for (const change of changes.slice(0, MAX_EXTERNAL_FILES)) {
+      const absolute = path.join(this.workspaceRoot, ...change.path.split('/'));
+      if (this.pending.has(this.relativize(absolute))) continue;
+
+      if (change.status === 'added') {
+        // Nothing to restore, but the file has to be removed on undo.
+        await this.captureContent(absolute, 'created', null);
+        recorded += 1;
+        continue;
+      }
+
+      const previous = await readTreeFile(
+        this.workspaceRoot,
+        before,
+        change.path,
+        this.config.maxFileBytes,
+      );
+      if (!previous) continue;
+      if ('tooLarge' in previous) {
+        await this.captureContent(absolute, change.status === 'deleted' ? 'deleted' : 'modified', null, `larger than ${formatBytes(this.config.maxFileBytes)}`);
+        recorded += 1;
+        continue;
+      }
+      await this.captureContent(
+        absolute,
+        change.status === 'deleted' ? 'deleted' : 'modified',
+        previous.content,
+      );
+      recorded += 1;
+    }
+
+    if (changes.length > MAX_EXTERNAL_FILES) {
+      log.warn('too many files changed to snapshot them all', {
+        changed: changes.length,
+        recorded,
+      });
+    }
+    return recorded;
   }
 
   /** True when the turn in progress has touched anything. */

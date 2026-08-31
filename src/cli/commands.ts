@@ -17,6 +17,8 @@ import { readGitState, summarizeGitState } from '../tools/git.js';
 import { shellInfo } from '../tools/terminal.js';
 import { formatCount, formatRelativeTime, pluralize } from '../util/format.js';
 import { formatCost } from '../context/usage.js';
+import { parseWindowArgument } from '../context/window.js';
+import { describeHook } from '../hooks/runner.js';
 import { tildify } from '../util/paths.js';
 import { maskKey } from '../util/redact.js';
 import { logFilePath } from '../util/logger.js';
@@ -70,6 +72,80 @@ export interface SlashCommand {
   usage?: string;
   aliases?: string[];
   run(args: string, context: SlashContext): Promise<void> | void;
+}
+
+/**
+ * Resize the context window from inside a session.
+ *
+ * The new size is written to the provider config so it survives a restart, and
+ * applied to the live agent immediately — every downstream budget (reply
+ * reserve, tool output ceiling, compaction threshold) is derived from it.
+ */
+async function resizeContext(spec: string, context: SlashContext): Promise<void> {
+  const { agent, config } = context;
+  const providerId = agent.provider.id;
+  const providerConfig = config.getProvider(providerId);
+  if (!providerConfig) {
+    context.notice('No provider is configured.', 'warning');
+    return;
+  }
+
+  const inForce = agent.context.getContextWindow();
+
+  // `auto` hands the decision back to the provider. The detected size only
+  // lands at the next launch, so say so rather than implying it took effect.
+  if (spec.toLowerCase() === 'auto' || spec.toLowerCase() === 'detect') {
+    if (providerConfig.contextWindow === undefined) {
+      context.notice('No override is set — the window already comes from detection.');
+      return;
+    }
+    await config.update((draft) => {
+      const entry = draft.providers[providerId];
+      if (entry) delete entry.contextWindow;
+    });
+    context.notice(
+      `Override cleared. ${providerConfig.label} will be asked at the next launch; this session stays at ${formatCount(inForce)}.`,
+      'success',
+    );
+    return;
+  }
+
+  const tokens = parseWindowArgument(spec, inForce);
+  if (tokens === undefined) {
+    context.notice(
+      `Cannot use "${spec}" as a context window. Try: /context up · /context down · /context 1m · /context +50k · /context auto`,
+      'warning',
+    );
+    return;
+  }
+
+  if (tokens === inForce) {
+    context.notice(`Already at ${formatCount(tokens)} tokens.`);
+    return;
+  }
+
+  // Refuse to shrink below what the conversation already occupies: the next
+  // request would be rejected outright, which is worse than saying no here.
+  const used = agent.context.budget(context.registry.definitions()).used;
+  if (tokens <= used) {
+    context.notice(
+      `${formatCount(tokens)} is smaller than the ${formatCount(used)} already in use. Run /compact first, or pick a larger size.`,
+      'warning',
+    );
+    return;
+  }
+
+  await config.update((draft) => {
+    const entry = draft.providers[providerId];
+    if (entry) entry.contextWindow = tokens;
+  });
+  agent.applyContextWindow({ tokens, source: 'explicit' });
+
+  const budget = agent.context.budget(context.registry.definitions());
+  context.notice(
+    `Context window ${tokens > inForce ? 'increased' : 'decreased'}: ${formatCount(inForce)} → ${formatCount(tokens)}. ${formatCount(budget.available)} free for this turn.`,
+    'success',
+  );
 }
 
 export const SLASH_COMMANDS: SlashCommand[] = [
@@ -270,8 +346,14 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   },
   {
     name: 'context',
-    description: 'Show how the context window is being used',
-    run(_args, context) {
+    description: 'Show context usage, or resize the window',
+    usage: '[up | down | +50k | -50k | <tokens> | auto]',
+    async run(args, context) {
+      const trimmed = args.trim();
+      if (trimmed) {
+        await resizeContext(trimmed, context);
+        return;
+      }
       const budget = context.agent.context.budget(context.registry.definitions());
       const { breakdown } = budget;
       const rows: Array<[string, number]> = [
@@ -299,7 +381,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
           `  ${'Total used'.padEnd(20)} ${formatCount(budget.used)} of ${formatCount(total)} (${Math.round(budget.ratio * 100)}%)`,
           `  ${'Messages'.padEnd(20)} ${context.agent.context.length}`,
           '```',
-          '_Compact the conversation with_ `/compact`',
+          '_Compact with_ `/compact`_ · resize with_ `/context up` _or_ `/context down`_._',
         ].join('\n'),
       );
     },
@@ -865,6 +947,46 @@ export const SLASH_COMMANDS: SlashCommand[] = [
           ),
           '```',
           '_Stop one with_ `/bg stop <id>`',
+        ].join('\n'),
+      );
+    },
+  },
+  {
+    name: 'hooks',
+    description: 'Show the lifecycle hooks that are running this session',
+    run(_args, context) {
+      const { enabled, entries } = context.config.get().hooks;
+      if (entries.length === 0) {
+        context.print(
+          [
+            '**Hooks**',
+            '',
+            'None configured. Hooks run a command when something happens — a file is',
+            'written, a turn ends, a session starts. They live in your user config;',
+            'run `orbit hooks` outside a session to see the shape.',
+          ].join('\n'),
+        );
+        return;
+      }
+
+      const lines = entries.map((hook) => {
+        const state = enabled && hook.enabled ? '●' : '○';
+        const extras = [
+          hook.tools.length > 0 ? hook.tools.join(', ') : undefined,
+          hook.blocking ? 'blocking' : undefined,
+          !hook.enabled ? 'disabled' : undefined,
+        ].filter(Boolean);
+        const suffix = extras.length > 0 ? `  (${extras.join(', ')})` : '';
+        return `  ${state} ${hook.on.padEnd(14)} ${describeHook(hook)}${suffix}`;
+      });
+
+      context.print(
+        [
+          `**Hooks**${enabled ? '' : '  — all disabled'}`,
+          '```',
+          ...lines,
+          '```',
+          '_Change them in your config file. Try one with_ `orbit hooks test <n>`_._',
         ].join('\n'),
       );
     },

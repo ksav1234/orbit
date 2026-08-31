@@ -328,6 +328,16 @@ export function App(props: AppProps): React.ReactElement {
           notice(event.message, 'warning');
           break;
 
+        case 'context-window':
+          // Detection can land after the banner has already scrolled past, so
+          // the corrected figure is stated in the transcript too.
+          setUsedTokens(agent.context.budget(registry.definitions()).used);
+          notice(
+            `Context window: ${event.tokens.toLocaleString()} tokens (${event.detail}).`,
+            'success',
+          );
+          break;
+
         case 'checkpoint':
           notice(
             `Checkpoint ${event.turn}: ${event.files} file${event.files === 1 ? '' : 's'} changed. /undo reverts it.`,

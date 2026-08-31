@@ -4,7 +4,7 @@ import type { OrbitConfig, ToolsConfig } from '../config/schema.js';
 import { ContextManager } from '../context/manager.js';
 import type { PermissionManager } from '../permissions/manager.js';
 import type { Sandbox } from '../permissions/sandbox.js';
-import type { AIProvider, ContentPart, ImagePart, Usage } from '../providers/provider.js';
+import type { AIProvider, ContentPart, ImagePart, ToolCall, Usage } from '../providers/provider.js';
 import { ToolRegistry, type DelegateRequest, type DelegateResult, type ToolContext, type ToolResult } from '../tools/registry.js';
 import type { CheckpointManager } from '../checkpoints/manager.js';
 import type { BackgroundRegistry } from '../tools/background.js';
@@ -28,6 +28,8 @@ import { Planner } from './planner.js';
 import { SUMMARIZER_PROMPT } from '../context/compaction.js';
 import { TokenOptimizer } from '../context/optimizer.js';
 import { UsageTracker } from '../context/usage.js';
+import { describeWindowSource, type WindowResolution, type WindowSource } from '../context/window.js';
+import type { HookPayload, HookRunner } from '../hooks/runner.js';
 import { buildSystemPrompt, PROJECT_INSTRUCTION_FILES } from './prompts.js';
 
 const log = createLogger('agent');
@@ -55,6 +57,20 @@ export interface AgentOptions {
   webApiKey?: string;
   /** Depth of this agent in the delegation tree. 0 is the user-facing agent. */
   depth?: number;
+  /**
+   * Resolve the context window for a provider/model pair. Injected so the
+   * agent never has to know about detection caches or the network; falls back
+   * to the provider's own estimate when absent.
+   */
+  resolveWindow?: (provider: AIProvider, model: string) => WindowResolution;
+  /**
+   * Ask the provider for the real window for a newly selected model. Called
+   * on every provider/model switch; the result is applied when it arrives, so
+   * a slow provider never delays the switch itself.
+   */
+  detectWindow?: (provider: AIProvider, model: string) => Promise<WindowResolution | undefined>;
+  /** User lifecycle hooks. Omit to run without any. */
+  hooks?: HookRunner;
 }
 
 export type AgentListener = (event: AgentEvent) => void;
@@ -73,6 +89,23 @@ export function responseReserveFor(contextWindow: number, maxTokens: number): nu
   const wanted = Math.min(maxTokens * 2, 16_000);
   const ceiling = Math.floor(contextWindow * MAX_RESERVE_SHARE);
   return Math.max(1024, Math.min(wanted, ceiling));
+}
+
+/**
+ * The single path a tool is acting on, when there is one.
+ *
+ * Hooks want `$ORBIT_FILE` for the common case — format the file that was just
+ * written — and the tools that take a path all name it the same way. A tool
+ * with several paths gets no variable rather than an arbitrary one.
+ */
+function filePathFromArgs(args: unknown): string | undefined {
+  if (!args || typeof args !== 'object') return undefined;
+  const record = args as Record<string, unknown>;
+  for (const key of ['path', 'file', 'file_path', 'filename']) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return undefined;
 }
 
 export interface AttachmentNotice {
@@ -98,6 +131,7 @@ export class Agent {
   private controller: AbortController | null = null;
   private session: SessionRecord;
   private toolHistory: ToolHistoryEntry[] = [];
+  private windowSource: WindowSource = 'name';
   private projectInstructions = '';
   private running = false;
 
@@ -117,13 +151,12 @@ export class Agent {
         },
       });
 
+    const window = this.windowFor(options.provider, options.model);
+    this.windowSource = window.source;
     this.context = new ContextManager({
-      contextWindow: options.provider.contextWindow(options.model),
+      contextWindow: window.tokens,
       compactThreshold: options.config.agent.compactThreshold,
-      responseReserve: responseReserveFor(
-        options.provider.contextWindow(options.model),
-        options.config.agent.maxTokens,
-      ),
+      responseReserve: responseReserveFor(window.tokens, options.config.agent.maxTokens),
     });
 
     if (options.session) {
@@ -187,9 +220,150 @@ export class Agent {
   /** Swap provider/model mid-session (`/model`, `/provider`). */
   async switchProvider(provider: AIProvider, model: string, label: string): Promise<void> {
     this.options = { ...this.options, provider, model, providerLabel: label };
-    this.context.setContextWindow(provider.contextWindow(model));
+    const window = this.windowFor(provider, model);
+    this.windowSource = window.source;
+    this.context.setContextWindow(
+      window.tokens,
+      responseReserveFor(window.tokens, this.options.config.agent.maxTokens),
+    );
     this.session.provider = { id: provider.id, label, model };
     this.refreshSystemPrompt();
+    void this.detectWindowFor(provider, model);
+  }
+
+  /**
+   * Best-effort window detection for a model that was just selected. A reply
+   * that arrives after the user switched again is discarded rather than
+   * applied to the wrong model.
+   */
+  private async detectWindowFor(provider: AIProvider, model: string): Promise<void> {
+    if (!this.options.detectWindow) return;
+    try {
+      const found = await this.options.detectWindow(provider, model);
+      if (!found) return;
+      if (this.options.provider !== provider || this.options.model !== model) return;
+      this.applyContextWindow(found);
+    } catch {
+      // Detection is an optimisation. The name-based window still works.
+    }
+  }
+
+  // ── hooks ────────────────────────────────────────────────────────────────
+
+  /** The turn about to run, 1-based, counted from the user messages so far. */
+  private turnNumber(): number {
+    return this.context.messages().filter((message) => message.role === 'user').length;
+  }
+
+  /** Facts every hook receives, before the event-specific extras. */
+  private hookPayloadBase(): Omit<HookPayload, 'event'> {
+    return {
+      workspace: this.options.sandbox.root,
+      sessionId: this.session.id,
+      model: this.options.model,
+      provider: this.options.providerLabel,
+    };
+  }
+
+  /**
+   * Fire a lifecycle event. Hook failures are surfaced through the runner's
+   * reporter, never thrown: a broken hook must not end a turn that succeeded.
+   */
+  async runHooks(
+    event: 'session-start' | 'session-end' | 'turn-start' | 'turn-end',
+    extra: Partial<HookPayload> = {},
+  ): Promise<void> {
+    const hooks = this.options.hooks;
+    if (!hooks?.has(event)) return;
+    try {
+      await hooks.run(event, { ...this.hookPayloadBase(), event, ...extra });
+    } catch (error) {
+      log.warn('hook event failed', { event, error: String(error) });
+    }
+  }
+
+  /** Adapts the hook runner to the narrow interface the loop asks for. */
+  private hookGateway(hooks: HookRunner): {
+    beforeTool(call: ToolCall, args: unknown, signal: AbortSignal): Promise<string | undefined>;
+    afterTool(
+      call: ToolCall,
+      args: unknown,
+      result: ToolResult,
+      signal: AbortSignal,
+    ): Promise<void>;
+  } {
+    const payloadFor = (call: ToolCall, args: unknown): Omit<HookPayload, 'event'> => ({
+      ...this.hookPayloadBase(),
+      tool: call.name,
+      toolArgs: args,
+      ...(filePathFromArgs(args) ? { file: filePathFromArgs(args) } : {}),
+    });
+
+    return {
+      beforeTool: async (call, args, signal) => {
+        if (!hooks.has('pre-tool', call.name)) return undefined;
+        try {
+          const veto = await hooks.vetoFor(
+            { ...payloadFor(call, args), event: 'pre-tool' },
+            signal,
+          );
+          return veto ? `${veto.hookName} — ${veto.reason}` : undefined;
+        } catch (error) {
+          // A hook that cannot run must not silently authorise the call, but
+          // neither should it wedge the session: report and allow.
+          log.warn('pre-tool hook failed', { tool: call.name, error: String(error) });
+          return undefined;
+        }
+      },
+      afterTool: async (call, args, result, signal) => {
+        if (!hooks.has('post-tool', call.name)) return;
+        try {
+          await hooks.run(
+            'post-tool',
+            { ...payloadFor(call, args), event: 'post-tool', ok: result.ok },
+            signal,
+          );
+        } catch (error) {
+          log.warn('post-tool hook failed', { tool: call.name, error: String(error) });
+        }
+      },
+    };
+  }
+
+  private windowFor(provider: AIProvider, model: string): WindowResolution {
+    const resolved = this.options.resolveWindow?.(provider, model);
+    return resolved ?? { tokens: provider.contextWindow(model), source: 'name' };
+  }
+
+  /** How the current window was arrived at, for the status line. */
+  contextWindowSource(): WindowSource {
+    return this.windowSource;
+  }
+
+  /**
+   * Adopt a window discovered after startup. Detection runs in the background,
+   * so this can land mid-session; the reserve and every derived budget are
+   * recomputed from the new size.
+   */
+  applyContextWindow(resolution: WindowResolution): void {
+    if (
+      resolution.tokens === this.context.getContextWindow() &&
+      resolution.source === this.windowSource
+    ) {
+      return;
+    }
+    this.windowSource = resolution.source;
+    this.context.setContextWindow(
+      resolution.tokens,
+      responseReserveFor(resolution.tokens, this.options.config.agent.maxTokens),
+    );
+    this.session.provider = { ...this.session.provider, model: this.options.model };
+    this.emit({
+      type: 'context-window',
+      tokens: resolution.tokens,
+      source: resolution.source,
+      detail: describeWindowSource(resolution.source, this.options.providerLabel),
+    });
   }
 
   refreshSystemPrompt(): void {
@@ -255,9 +429,17 @@ export class Agent {
         emit: (event) => this.handleEvent(event),
         summarize: (transcript, signal) => this.summarize(transcript, signal),
         onToolExecuted: (name, result) => this.recordToolUse(name, result),
+        ...(this.options.hooks ? { hooks: this.hookGateway(this.options.hooks) } : {}),
       });
 
+      await this.runHooks('turn-start', { turn: this.turnNumber() });
+
       const result = await loop.run(this.controller.signal);
+
+      await this.runHooks('turn-end', {
+        turn: this.turnNumber(),
+        turnEndReason: result.reason,
+      });
 
       // Close the checkpoint even on cancellation: files already written have
       // to be undoable, or a half-finished turn would be stranded.

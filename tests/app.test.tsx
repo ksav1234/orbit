@@ -158,6 +158,36 @@ async function waitFor(check: () => boolean, timeoutMs = 25_000): Promise<void> 
   throw new Error('timed out waiting for the expected UI state');
 }
 
+/**
+ * Press a key and wait for the UI to react, re-sending if it does not.
+ *
+ * Ink attaches its stdin handler in an effect, which runs *after* the frame
+ * announcing the prompt is already visible. Under load that gap is wide enough
+ * for a single write to land in it and be dropped, which turns a one-shot
+ * keypress into a coin flip -- the failure looks like a 25s hang with no
+ * progress rather than a slow pass.
+ *
+ * Only safe for keys where pressing twice means the same as pressing once
+ * (deny, cancel, dismiss). Do not use it for arrows or text.
+ */
+async function pressUntil(
+  instance: { stdin: { write(data: string): void } },
+  key: string,
+  done: () => boolean,
+  timeoutMs = 20_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (done()) return;
+    instance.stdin.write(key);
+    for (let i = 0; i < 8 && Date.now() < deadline; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (done()) return;
+    }
+  }
+  throw new Error(`timed out after pressing ${JSON.stringify(key)}`);
+}
+
 const ENTER = '\r';
 
 describe('Orbit app', () => {
@@ -219,9 +249,7 @@ describe('Orbit app', () => {
     await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('Permission required'));
     expect(stripAnsi(instance.lastFrame() ?? '')).toContain('blocked.txt');
 
-    instance.stdin.write('n');
-
-    await waitFor(() => output().includes('I did not write the file.'));
+    await pressUntil(instance, 'n', () => output().includes('I did not write the file.'));
     await expect(fs.access(path.join(workspace, 'blocked.txt'))).rejects.toThrow();
     expect(output()).toContain('denied');
 
@@ -365,9 +393,9 @@ describe('Orbit app', () => {
     instance.stdin.write(ENTER);
 
     await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('Destructive operation'));
-    instance.stdin.write('n');
-
-    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'));
+    await pressUntil(instance, 'n', () =>
+      stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'),
+    );
     // The file survives a denial.
     expect(await fs.readFile(path.join(workspace, 'old.txt'), 'utf8')).toBe('bye\n');
 

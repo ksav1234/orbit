@@ -119,6 +119,13 @@ export interface AIProvider {
 
   /** Context window in tokens for the given model, used for compaction budgets. */
   contextWindow(model: string): number;
+
+  /**
+   * Ask the service to state this model's context window, for providers whose
+   * models endpoint does not carry it. Resolves to `undefined` when the
+   * provider will not say. Implementations must not generate any tokens.
+   */
+  probeContextWindow?(model: string, signal?: AbortSignal): Promise<number | undefined>;
 }
 
 // ── Capability heuristics ──────────────────────────────────────────────────
@@ -162,19 +169,25 @@ export function guessToolSupport(model: string): boolean {
   return true;
 }
 
+/**
+ * Last-resort windows by model name. Every entry here is a guess that goes
+ * stale the moment a vendor ships a new generation, so it is only consulted
+ * after the provider has been asked directly (see `context/window.ts`).
+ * Patterns are family-wide rather than version-pinned for the same reason.
+ */
 const CONTEXT_WINDOWS: Array<[RegExp, number]> = [
   [/gpt-5|gpt-4\.1/i, 400_000],
   [/gpt-4o/i, 128_000],
   [/o[34]-?(mini)?/i, 200_000],
-  [/claude-(opus|sonnet|haiku)-4/i, 200_000],
+  [/claude-(opus|sonnet|haiku)/i, 200_000],
   [/claude-3/i, 200_000],
-  [/gemini-2\.5-pro/i, 1_000_000],
   [/gemini/i, 1_000_000],
-  [/deepseek-(chat|reasoner|v3)/i, 128_000],
+  [/deepseek/i, 128_000],
   [/qwen3?-coder/i, 262_144],
   [/qwen/i, 131_072],
-  [/llama-?3\.[13]/i, 131_072],
+  [/llama-?[34]/i, 131_072],
   [/mistral|mixtral/i, 32_768],
+  [/grok/i, 131_072],
 ];
 
 export function guessContextWindow(model: string): number {

@@ -82,6 +82,11 @@ export const executeCommandTool: Tool = defineTool({
 
     context.progress(`$ ${oneLine(args.command, 60)}`);
 
+    // A shell command can change anything, and nothing here can tell what in
+    // advance — so the working tree is snapshotted around it and whatever moved
+    // is recorded, which is what makes /undo cover shell work at all.
+    const snapshot = await context.checkpoints?.beginExternalChange();
+
     const result = await runCommand({
       command: args.command,
       shell: true,
@@ -104,6 +109,15 @@ export const executeCommandTool: Tool = defineTool({
         if (line) context.progress(oneLine(line, 70));
       },
     });
+
+    // Before any early return: a command that timed out or was cancelled may
+    // still have written files, and those have to be undoable too.
+    if (snapshot) {
+      const recorded = await context.checkpoints?.recordExternalChanges(snapshot);
+      if (recorded) {
+        context.progress(`${recorded} file${recorded === 1 ? '' : 's'} changed — /undo can revert`);
+      }
+    }
 
     const output = redact(result.output.trimEnd());
     const exitCode = result.code;

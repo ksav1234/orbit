@@ -102,7 +102,8 @@ export class AnthropicProvider implements AIProvider {
       .map((entry) => ({
         id: entry.id,
         label: entry.display_name,
-        contextWindow: this.contextWindow(entry.id),
+        // Anthropic's models endpoint does not carry a context window, and a
+        // name guess here would be mistaken for one.
         supportsTools: true,
         supportsVision: true,
       }));

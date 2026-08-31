@@ -35,7 +35,12 @@ export const ProviderConfigSchema = z.object({
   /** Overrides for capability detection when a model is not in the built-in tables. */
   supportsTools: z.boolean().optional(),
   supportsVision: z.boolean().optional(),
-  /** Model context window in tokens, when the provider does not report one. */
+  /**
+   * An explicit context window in tokens, set by `orbit model context <n>`.
+   * When present it wins over anything detected — including what the provider
+   * reports — because the user asked for it. Detected values are cached
+   * separately, per model, and never written here.
+   */
   contextWindow: z.number().int().positive().optional(),
 });
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
@@ -100,6 +105,16 @@ export const CheckpointsConfigSchema = z.object({
   maxPerSession: z.number().int().min(1).max(500).default(50),
   /** Files larger than this are recorded but not snapshotted. */
   maxFileBytes: z.number().int().positive().default(2_000_000),
+  /**
+   * Also snapshot around shell commands, so `/undo` covers what a command
+   * changed and not only what Orbit's own file tools did.
+   *
+   * Implemented with git: the working tree is written to a tree object before
+   * and after the command, which is cheap because git reuses blobs it already
+   * has and respects `.gitignore`. Needs a git work tree; without one this does
+   * nothing.
+   */
+  shellCommands: z.boolean().default(true),
 });
 export type CheckpointsConfig = z.infer<typeof CheckpointsConfigSchema>;
 
@@ -197,6 +212,20 @@ export const OptimizerConfigSchema = z.object({
    * it supports it. Cuts input cost on long sessions.
    */
   promptCaching: z.boolean().default(true),
+  /**
+   * Ask the provider for the active model's real context window at startup,
+   * instead of inferring it from the model name. Detection runs in the
+   * background and is cached per model, so it costs at most one request the
+   * first time a model is used.
+   */
+  autoDetectWindow: z.boolean().default(true),
+  /**
+   * When the provider's models endpoint does not report a window, make the
+   * provider name its own limit by asking for an impossible completion
+   * length. The request is rejected during validation, so no tokens are
+   * generated. Turn this off to keep startup to zero extra requests.
+   */
+  probeWindow: z.boolean().default(true),
 });
 export type OptimizerConfig = z.infer<typeof OptimizerConfigSchema>;
 
@@ -220,6 +249,57 @@ export const AutoModeConfigSchema = z.object({
 });
 export type AutoModeConfig = z.infer<typeof AutoModeConfigSchema>;
 
+/**
+ * Lifecycle hooks: shell commands Orbit runs when something happens.
+ *
+ * Hooks execute arbitrary commands, so they are read **only** from your own
+ * `~/.orbit/config.json` — never from anything inside a workspace. A cloned
+ * repository must not be able to run code on your machine just because you
+ * opened it in Orbit.
+ */
+export const HOOK_EVENTS = [
+  'session-start',
+  'session-end',
+  'turn-start',
+  'turn-end',
+  'pre-tool',
+  'post-tool',
+] as const;
+export const HookEventSchema = z.enum(HOOK_EVENTS);
+export type HookEvent = z.infer<typeof HookEventSchema>;
+
+export const HookSchema = z.object({
+  /** Shown in `/hooks` and in errors, so a failing hook is identifiable. */
+  name: z.string().optional(),
+  on: HookEventSchema,
+  /** The command line. Run through the platform shell unless `shell` is off. */
+  command: z.string().min(1),
+  /**
+   * Tool names this applies to, for `pre-tool` and `post-tool`. Entries are
+   * matched literally or, when wrapped in slashes, as a regular expression.
+   * Empty means every tool, which is rarely what you want.
+   */
+  tools: z.array(z.string()).default([]),
+  shell: z.boolean().default(true),
+  timeoutMs: z.number().int().positive().max(600_000).default(60_000),
+  /**
+   * For `pre-tool`: a non-zero exit **denies the tool call**, with the hook's
+   * output as the reason the model is given. Ignored on other events, where
+   * there is nothing to deny.
+   */
+  blocking: z.boolean().default(false),
+  /** Put the hook's output in the transcript, not just the debug log. */
+  showOutput: z.boolean().default(false),
+  enabled: z.boolean().default(true),
+});
+export type HookConfig = z.infer<typeof HookSchema>;
+
+export const HooksConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  entries: z.array(HookSchema).default([]),
+});
+export type HooksConfig = z.infer<typeof HooksConfigSchema>;
+
 export const ConfigSchema = z.object({
   version: z.literal(1).default(1),
   activeProvider: z.string().optional(),
@@ -234,6 +314,7 @@ export const ConfigSchema = z.object({
   subagents: SubagentConfigSchema.default({}),
   pricing: PricingConfigSchema.default({}),
   tools: ToolsConfigSchema.default({}),
+  hooks: HooksConfigSchema.default({}),
   ui: UiConfigSchema.default({}),
   sessions: SessionsConfigSchema.default({}),
 });
@@ -287,9 +368,9 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     description: 'DeepSeek chat and reasoning models.',
     keyUrl: 'https://platform.deepseek.com/api_keys',
     models: ['deepseek-chat', 'deepseek-reasoner'],
-    // DeepSeek documents 128K. If your account or endpoint serves a larger
-    // window, raise it with `orbit model context <tokens>` and the optimizer
-    // will scale reply and tool budgets to match.
+    // A floor, not a claim: Orbit asks DeepSeek for the active model's real
+    // window at startup and uses that when the API answers. This only applies
+    // when detection is off or the provider stays silent.
     contextWindow: 128_000,
   },
   {

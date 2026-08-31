@@ -1,5 +1,6 @@
 import { OrbitError, isCancellation } from '../util/errors.js';
 import { createLogger } from '../util/logger.js';
+import { parseWindowFromError } from '../context/window.js';
 import { httpErrorFor, parseSSE, rawRequest, requestJSON } from './http.js';
 import {
   collectStream,
@@ -66,6 +67,33 @@ interface OpenAIChunk {
 }
 
 /**
+ * Pull a context window off a `/models` entry. Different servers spell it
+ * differently and none of them are required to include it at all, so this
+ * returns `undefined` rather than guessing.
+ */
+function readReportedWindow(entry: Record<string, unknown>): number | undefined {
+  const keys = [
+    'context_length',
+    'context_window',
+    'max_context_length',
+    'max_model_len',
+    'max_input_tokens',
+    'inputTokenLimit',
+  ] as const;
+  for (const key of keys) {
+    const value = entry[key];
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 1024) return value;
+  }
+  // OpenRouter nests the same figure under `top_provider`.
+  const nested = entry.top_provider;
+  if (nested && typeof nested === 'object') {
+    const value = (nested as { context_length?: unknown }).context_length;
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 1024) return value;
+  }
+  return undefined;
+}
+
+/**
  * Adapter for every endpoint that speaks the OpenAI chat-completions dialect:
  * OpenAI, DeepSeek, OpenRouter, NVIDIA NIM, vLLM, Ollama, and custom servers.
  */
@@ -118,6 +146,46 @@ export class OpenAICompatibleProvider implements AIProvider {
     return this.windowOverride ?? guessContextWindow(model);
   }
 
+  /**
+   * Ask for an impossible completion length and read the limit out of the
+   * refusal. OpenAI-compatible servers validate `max_tokens` against the
+   * model's window and name the real figure when they reject it, which is a
+   * far better source than any table Orbit could keep current.
+   *
+   * The request is rejected during validation, so no tokens are generated and
+   * nothing is billed. A single-character message keeps it that way even on a
+   * server that decides to answer anyway.
+   */
+  async probeContextWindow(model: string, signal?: AbortSignal): Promise<number | undefined> {
+    const response = await rawRequest({
+      url: `${this.baseURL}/chat/completions`,
+      method: 'POST',
+      headers: { ...this.headers(), 'content-type': 'application/json' },
+      body: {
+        model,
+        messages: [{ role: 'user', content: 'x' }],
+        // Large enough that no real model can satisfy it, small enough to stay
+        // inside a signed 32-bit int for servers that parse it as one.
+        max_tokens: 2_000_000_000,
+        stream: false,
+      },
+      signal,
+      providerName: this.name,
+    });
+
+    // A server that accepts this is not enforcing a limit it will tell us
+    // about, so there is nothing to learn.
+    if (response.ok) return undefined;
+
+    let text = '';
+    try {
+      text = (await response.text()).slice(0, 4000);
+    } catch {
+      return undefined;
+    }
+    return parseWindowFromError(text);
+  }
+
   async listModels(signal?: AbortSignal): Promise<ModelInfo[]> {
     const payload = await requestJSON<{ data?: Array<Record<string, unknown>> }>({
       url: `${this.baseURL}/models`,
@@ -131,15 +199,13 @@ export class OpenAICompatibleProvider implements AIProvider {
       .map((entry): ModelInfo | null => {
         const id = String(entry.id ?? entry.name ?? '');
         if (!id) return null;
-        const window =
-          typeof entry.context_length === 'number'
-            ? entry.context_length
-            : typeof (entry as { context_window?: number }).context_window === 'number'
-              ? (entry as { context_window: number }).context_window
-              : undefined;
+        // Leave `contextWindow` unset when the endpoint did not say. Filling
+        // it in from a name guess here would make the guess indistinguishable
+        // from a real answer everywhere downstream.
+        const window = readReportedWindow(entry);
         return {
           id,
-          contextWindow: window ?? this.contextWindow(id),
+          ...(window === undefined ? {} : { contextWindow: window }),
           supportsTools: this.supportsTools(id),
           supportsVision: this.supportsVision(id),
         } satisfies ModelInfo;

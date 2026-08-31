@@ -287,21 +287,72 @@ next one to the window that is left:
 
 ### Context windows
 
-Orbit detects the window from the model name, and prefers what the provider
-reports from its model list. When neither is right — a large-context deployment,
-a self-hosted build — set it explicitly:
+The window drives every budget in a session, so Orbit **asks the provider** what
+it is rather than guessing from the model name. Detection runs in the background
+at launch, overlapping with the rest of startup, and is cached per model — so it
+costs at most one request the first time you use a model, and nothing after that.
 
-```bash
-orbit model context 1000000     # this model really does have a 1M window
-orbit model context auto        # go back to detection
+Sources, in order of authority:
+
+| Source | How Orbit gets it |
+| ------ | ----------------- |
+| **You** | `orbit model context <n>`. Never overridden by anything below. |
+| **Reported** | the provider's own model list says so — OpenRouter's `context_length`, Gemini's `inputTokenLimit`, vLLM's `max_model_len`. |
+| **Probed** | the provider names its limit when refusing an impossible completion length. Rejected during validation, so no tokens are generated. |
+| **Preset** | the built-in preset, when the model name implies nothing more specific. |
+| **Name** | inferred from the model name. A guess, and labelled as one. |
+
+Whichever applies, the banner and `orbit model context` tell you which:
+
+```
+› orbit model context
+
+  Model           deepseek-v4-pro
+  Context window  1,000,000 tokens  (reported by DeepSeek)
 ```
 
-The optimizer scales to whatever you set. If the provider then rejects requests
-as too long, the number was wrong: lower it.
+```bash
+orbit model context             # what is in force, and where it came from
+orbit model context up          # one step larger
+orbit model context down        # one step smaller
+orbit model context +50k        # relative to the current window
+orbit model context 1m          # an exact size (1000000 and 128k also work)
+orbit model context detect      # ask the provider again (a model was resized)
+orbit model context auto        # drop the override, go back to detection
+```
 
-> Orbit ships each preset with the window its provider documents (DeepSeek's is
-> 128K). It will not claim a larger one on your behalf — a wrong number here
-> means rejected requests, not a bigger budget.
+`up` and `down` walk a ladder of the sizes models actually ship with — 8k, 16k,
+32k, 64k, 128k, 200k, 256k, 400k, 512k, 1M — so a step always lands somewhere
+plausible. An off-ladder size snaps in the direction you asked for, never past
+it. `orbit config → Context window` is the same thing as a menu, with the
+resulting size previewed on each option, and it loops so three steps up is three
+keypresses.
+
+Inside a session, `/context` on its own shows the usage breakdown, and takes the
+same arguments to resize live:
+
+```
+› /context up
+Context window increased: 128k → 131k. 118k free for this turn.
+```
+
+A resize that would shrink the window below what the conversation already
+occupies is refused — the next request would be rejected by the provider
+otherwise. `/compact` first, or pick a larger size.
+
+A window discovered after the banner has scrolled past is applied to the live
+session and announced in the transcript — the reply reserve, tool-output limits
+and compaction threshold are all recomputed from the new size, so switching from
+a 32k model to a 1M one actually gets you the room.
+
+Detection can be turned off in `orbit config` (`optimizer.autoDetectWindow`), and
+the probe specifically with `optimizer.probeWindow` if you want startup to make
+zero extra requests. The cache lives at `~/.orbit/cache/context-windows.json` and
+is safe to delete.
+
+> Orbit will not claim a window on your provider's behalf. If a provider stays
+> silent, Orbit says so and falls back to a documented figure — a number that is
+> too large here means rejected requests, not a bigger budget.
 
 ```
 › /usage
@@ -374,9 +425,50 @@ Undid turn 2 — fix the failing test
 
 `/undo` reverts the last turn, `/rewind <turn>` goes further back. Content is
 stored by hash in `~/.orbit/checkpoints`, so repeated edits to the same file are
-cheap, and the history survives a restart and a `orbit resume`. This is not git:
-it never touches your index, your stash or your branches, and it works in a
-directory that is not a repository at all.
+cheap, and the history survives a restart and a `orbit resume`. It never touches
+your index, your stash or your branches.
+
+### Shell commands are covered too
+
+Orbit's file tools say what they are about to change, so their previous contents
+can be saved one file at a time. A shell command can change anything, and there
+is no way to know what in advance — so the whole working tree is captured before
+and after it runs, and whatever moved is recorded.
+
+That uses git as a fast content store: the tree is written to a git tree object,
+which reuses blobs git already has and honours `.gitignore`, so `node_modules`
+and build output are never snapshotted. Your index, stash and branches are
+untouched — the temporary index is a throwaway copy, and the objects written are
+unreferenced, so they never appear in `git status` or `git log` and `git gc`
+prunes them.
+
+```
+› run the codegen script
+
+  $ npm run codegen
+  14 files changed — /undo can revert
+
+› /undo
+Undid turn 3 — run the codegen script
+  restored  14 files
+```
+
+Files a command *created* are deleted on undo; files it deleted are restored.
+A command that timed out or was cancelled still gets its partial writes
+recorded, because those need undoing most.
+
+Two caveats, both deliberate:
+
+- **It needs a git work tree.** In a plain directory, shell commands are not
+  covered — Orbit's own file tools still are. There is no way to reconstruct the
+  previous contents of a file nothing had a copy of.
+- **It costs roughly 100ms per shell command** (two snapshots), scaling with the
+  number of tracked files rather than the repo's size on disk. Turn it off with
+  `checkpoints.shellCommands: false` in the config, or in
+  `orbit config → Checkpoints and undo`.
+
+A single command that rewrites more than 400 files records the first 400 and logs
+that it stopped, rather than turning one undo into a multi-gigabyte snapshot.
 
 Orbit also refuses to overwrite a file that **changed on disk after it read it** —
 usually because you edited it in your editor mid-turn. It tells the model to
@@ -396,6 +488,88 @@ the model to open a page with `web_fetch` before treating anything as
 authoritative.
 
 Set `TAVILY_API_KEY` and Orbit will use that instead of the stored key.
+
+## Lifecycle hooks
+
+Hooks are shell commands Orbit runs when something happens: a file is written, a
+turn finishes, a session starts. They turn Orbit from a thing that edits code
+into a thing that edits code *and then formats it, and runs the tests*.
+
+They live under `hooks` in `~/.orbit/config.json`:
+
+```json
+{
+  "hooks": {
+    "enabled": true,
+    "entries": [
+      {
+        "name": "format",
+        "on": "post-tool",
+        "tools": ["write_file", "edit_file"],
+        "command": "npx prettier --write \"$ORBIT_FILE\""
+      },
+      {
+        "name": "test",
+        "on": "turn-end",
+        "command": "npm test",
+        "showOutput": true
+      },
+      {
+        "name": "protect-secrets",
+        "on": "pre-tool",
+        "tools": ["/^(write|edit|delete)_/"],
+        "command": "sh -c 'case \"$ORBIT_FILE\" in *.env*) exit 1 ;; esac'",
+        "blocking": true
+      }
+    ]
+  }
+}
+```
+
+| Event | When |
+| ----- | ---- |
+| `session-start` | once, after the workspace and model are ready |
+| `session-end` | once, on exit — interactive and `--print` alike |
+| `turn-start` | you submitted a prompt |
+| `turn-end` | the agent stopped working on it |
+| `pre-tool` | before a tool runs. With `blocking`, a non-zero exit **refuses the call** |
+| `post-tool` | after a tool ran, before the model sees the result |
+
+`tools` filters the tool events: a bare string matches exactly, `/pattern/` is a
+regular expression. An empty list matches every tool.
+
+Each hook is handed the details twice — as environment variables for one-liners,
+and as JSON on stdin for scripts:
+
+| Variable | |
+| -------- | - |
+| `ORBIT_EVENT` | the event name |
+| `ORBIT_WORKSPACE` | the workspace root (also the hook's working directory) |
+| `ORBIT_FILE` / `ORBIT_FILE_RELATIVE` | the path the tool is acting on, when there is exactly one |
+| `ORBIT_TOOL` / `ORBIT_TOOL_ARGS` | the tool name, and its arguments as JSON |
+| `ORBIT_TOOL_OK` | `1` or `0`, on `post-tool` |
+| `ORBIT_MODEL` / `ORBIT_PROVIDER` / `ORBIT_SESSION` | the session's identity |
+| `ORBIT_TURN` / `ORBIT_TURN_REASON` | turn number, and how the turn ended |
+
+```bash
+orbit hooks              # list them, with their filters and flags
+orbit hooks test 2       # run one now and show what it did
+orbit hooks test 2 write_file   # …against a specific tool name
+```
+
+`/hooks` shows the same list inside a session.
+
+Hooks for one event run **in order, one at a time** — two formatters racing on
+the same file is not a bug anyone can debug. Each is bounded by `timeoutMs`
+(60s default), its output is capped and redacted, and a hook that fails is
+reported without taking the turn down with it. The one exception is a `blocking`
+`pre-tool` hook: its non-zero exit is the whole point.
+
+> **Hooks are read from your user config only — never from anything inside a
+> workspace.** A hook is arbitrary code, so cloning a repository and opening it
+> in Orbit must not be able to run anything. There is deliberately no
+> `orbit hooks add`: a command Orbit will execute on your behalf belongs in a
+> file you edited on purpose.
 
 ## MCP servers
 
@@ -559,8 +733,9 @@ passing.
 - `find_symbol` is a lexical index, not a parser. It finds declarations reliably
   in the languages listed above and nothing at all in the ones it does not know.
 - Cost estimates need rates you enter yourself. Orbit ships no price table.
-- Checkpoints cover files the agent's tools touched. Changes made by a shell
-  command it ran are not snapshotted — `git` remains the safety net for those.
+- Checkpoints cover shell commands only inside a git work tree, since that is
+  what makes capturing the whole tree cheap. In a plain directory, only the
+  agent's own file tools are undoable.
 - Stale-write detection compares modification time and size. On filesystems with
   one-second timestamp granularity (older HFS+), an external edit made in the
   same second *and* of identical size would go unnoticed.

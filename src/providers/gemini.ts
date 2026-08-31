@@ -100,7 +100,7 @@ export class GeminiProvider implements AIProvider {
         return {
           id,
           label: m.displayName,
-          contextWindow: m.inputTokenLimit ?? this.contextWindow(id),
+          ...(m.inputTokenLimit ? { contextWindow: m.inputTokenLimit } : {}),
           supportsTools: true,
           supportsVision: true,
         } satisfies ModelInfo;

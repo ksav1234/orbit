@@ -50,7 +50,7 @@ export class ContextManager {
    * effective reserve so switching to a small model and back restores it,
    * rather than leaving a large model permanently squeezed.
    */
-  private readonly configuredReserve: number;
+  private configuredReserve: number;
 
   constructor(options: ContextManagerOptions) {
     this.window = options.contextWindow;
@@ -74,8 +74,16 @@ export class ContextManager {
     return this.systemPrompt;
   }
 
-  setContextWindow(window: number): void {
+  /**
+   * Resize the window, optionally re-basing the reserve.
+   *
+   * The reserve is passed in when the *window itself* changed shape — a model
+   * switch, or detection discovering the real size — because a reserve derived
+   * from a 32k window is far too small to hold an answer on a 1M one.
+   */
+  setContextWindow(window: number, responseReserve?: number): void {
     this.window = window;
+    if (responseReserve !== undefined) this.configuredReserve = responseReserve;
     this.reserve = this.reserveFor(window);
   }
 

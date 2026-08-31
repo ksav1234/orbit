@@ -44,6 +44,7 @@ export type AgentEvent =
   | { type: 'optimization'; decision: OptimizationDecision }
   | { type: 'retry'; attempt: number; delayMs: number; reason: string }
   | { type: 'notice'; message: string }
+  | { type: 'context-window'; tokens: number; source: string; detail: string }
   | { type: 'checkpoint'; turn: number; files: number }
   | { type: 'error'; error: OrbitError }
   | { type: 'turn-end'; reason: TurnEndReason; iterations: number };
@@ -76,6 +77,14 @@ export interface AgentLoopDeps {
   /** Used by context compaction to fold old turns into a written summary. */
   summarize?: (transcript: string, signal?: AbortSignal) => Promise<string>;
   onToolExecuted?(name: string, result: ToolResult): void;
+  /**
+   * Lifecycle hooks around tool execution. `beforeTool` may veto the call by
+   * returning a reason, which is reported to the model as a denial.
+   */
+  hooks?: {
+    beforeTool(call: ToolCall, args: unknown, signal: AbortSignal): Promise<string | undefined>;
+    afterTool(call: ToolCall, args: unknown, result: ToolResult, signal: AbortSignal): Promise<void>;
+  };
 }
 
 /**
@@ -518,6 +527,17 @@ export class AgentLoop {
       this.deps.optimizer?.toolLimits(),
     );
 
+    // A blocking pre-tool hook gets to refuse before anything runs. The model
+    // is told why, so it can adapt rather than retrying the same call.
+    if (this.deps.hooks) {
+      const veto = await this.deps.hooks.beforeTool(call, args, signal);
+      if (veto) {
+        emit({ type: 'tool-denied', callId: call.id, name: tool.name, reason: veto });
+        context.addToolResult(call, `Refused by a hook: ${veto}`);
+        return { names: [] };
+      }
+    }
+
     let result: ToolResult;
     try {
       result = await withTimeout(
@@ -538,6 +558,9 @@ export class AgentLoop {
     const durationMs = Date.now() - started;
     emit({ type: 'tool-end', callId: call.id, name: tool.name, result, durationMs });
     this.deps.onToolExecuted?.(tool.name, result);
+    // Runs before the result is handed back, so a formatter has finished with
+    // the file by the time the model reads about it.
+    if (this.deps.hooks) await this.deps.hooks.afterTool(call, args, result, signal);
 
     context.addToolResult(call, result.content);
 
