@@ -77,8 +77,14 @@ export const executeCommandTool: Tool = defineTool({
     }
 
     const cwd = args.cwd ? context.sandbox.resolve(args.cwd) : null;
-    const workingDir = cwd?.absolute ?? context.cwd;
     const timeoutMs = args.timeout_ms ?? context.config.shellTimeoutMs;
+
+    // With a session, `cd` and exported variables survive to the next command.
+    // An explicit `cwd` argument overrides where the session had got to.
+    const session = context.config.persistentShell ? context.shellSession : undefined;
+    if (session && cwd) session.useCwd(cwd.absolute);
+    const workingDir = session ? session.currentCwd() : (cwd?.absolute ?? context.cwd);
+    const prepared = session ? await session.prepare(args.command) : undefined;
 
     context.progress(`$ ${oneLine(args.command, 60)}`);
 
@@ -88,14 +94,16 @@ export const executeCommandTool: Tool = defineTool({
     const snapshot = await context.checkpoints?.beginExternalChange();
 
     const result = await runCommand({
-      command: args.command,
-      shell: true,
+      ...(prepared
+        ? { command: prepared.command, args: prepared.args, shell: false }
+        : { command: args.command, shell: true }),
       cwd: workingDir,
       signal: context.signal,
       timeoutMs,
       maxOutputChars: context.config.maxOutputChars,
       env: {
         ...process.env,
+        ...(prepared?.env ?? {}),
         // Keep tool output parseable: no pagers, no interactive prompts.
         GIT_PAGER: 'cat',
         PAGER: 'cat',
@@ -109,6 +117,9 @@ export const executeCommandTool: Tool = defineTool({
         if (line) context.progress(oneLine(line, 70));
       },
     });
+
+    // Whatever the exit code, pick up wherever the command left the shell.
+    await prepared?.finish();
 
     // Before any early return: a command that timed out or was cancelled may
     // still have written files, and those have to be undoable too.

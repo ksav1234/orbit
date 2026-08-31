@@ -285,6 +285,51 @@ next one to the window that is left:
 - the stable prefix (system prompt + tool schemas) is marked for **prompt
   caching** where the provider supports it, and cache hits show up in `/usage`.
 
+### What each request costs
+
+Every model request prints what it actually used, from the provider's own
+figures rather than an estimate:
+
+```
+› refactor the auth middleware
+
+  … Orbit works …
+
+  up 12.4k  ·  down 1.2k  ·  940 thinking  ·  8.2k cached  ·  31k/128k ctx  ·  3.4s
+```
+
+`thinking` is the part of the output the model spent reasoning, which reasoning
+models bill as output tokens but report separately — so a long think is visible
+instead of just expensive. It comes from `completion_tokens_details.reasoning_tokens`
+on OpenAI-compatible providers and `thoughtsTokenCount` on Gemini; providers that
+do not separate it simply do not show the figure.
+
+While a model is still thinking, the live counter beside the trace is Orbit's own
+estimate of the text so far and is marked `~`. The provider's real number
+replaces it when the request completes. Turn the whole line off with
+`ui.requestCost: false`.
+
+`/usage` totals it per session and lifetime, including the thinking share.
+
+### Real prices, where the provider publishes them
+
+Orbit still ships no rate table — prices change, and a stale number is worse
+than none. What it can do is ask:
+
+```bash
+orbit pricing import                            # from what the provider publishes
+orbit pricing set "DeepSeek:deepseek-chat" 0.27 1.10
+orbit pricing                                   # what is in force
+```
+
+OpenRouter publishes machine-readable per-token prices, so `import` fills them in
+exactly. A model listed under two vendors at different prices is **left
+unpriced** rather than guessed at. A provider on a local address that publishes
+nothing is priced at zero — but only after being asked, so a paid API behind a
+localhost proxy is not silently free.
+
+Thinking tokens are billed as output, and are counted there.
+
 ### Context windows
 
 The window drives every budget in a session, so Orbit **asks the provider** what
@@ -375,6 +420,33 @@ Lifetime totals are kept per model in `~/.orbit/usage.json` (counts only, never
 content) and are shown in `orbit config`, where they can also be cleared. Turn
 the whole thing off with `--no-optimize` or in the config screen.
 
+## When a provider will not answer
+
+Eight providers configurable and no fallback meant one rate limit ended the
+turn. Now it can ask someone else:
+
+```bash
+orbit failover add openrouter    # try this if the active provider fails
+orbit failover                   # show the chain and what triggers it
+orbit failover off
+```
+
+A switch happens **mid-turn**, keeping every message and tool result already
+gathered, and is announced in the transcript — which model wrote the rest of an
+answer is not something to change quietly. Usage and cost are attributed to
+whoever actually answered.
+
+| Triggers a switch | Does not |
+| --- | --- |
+| `429` rate limit | `400` — the request is at fault and would be rejected everywhere |
+| `402` no credit | a tool schema the model got wrong |
+| `5xx` server trouble | a prompt over the window |
+| auth and network failures (opt in) | anything the model itself did |
+
+Each provider is tried at most once per turn, candidates with no key are skipped,
+and by default the next turn goes back to the primary rather than quietly
+settling on the fallback.
+
 ## Tools
 
 | Group      | Tools                                                            |
@@ -406,6 +478,55 @@ is discarded with its context. Read-only by default.
 **`run_background`** starts a dev server or watcher that outlives the tool call,
 so the agent can check its output later instead of blocking a turn on it.
 Everything Orbit starts is stopped when Orbit exits.
+
+## The shell remembers
+
+`cd` and exported variables carry from one command to the next:
+
+```
+$ cd packages/api
+$ pwd
+/home/me/project/packages/api      ← not the workspace root
+$ export NODE_ENV=test
+$ echo $NODE_ENV
+test
+```
+
+Each command still runs in its own process — only the resulting directory and
+environment persist — so exit codes, timeouts and cancellation are exactly as
+before. A long-lived interactive shell would be the other approach, and would
+mean parsing prompts to guess where one command's output ends, which is not
+something to build a timeout on.
+
+A command that leaves the workspace does **not** take the session with it: `cd /`
+runs, and the next command is still inside the sandbox. Only variables that
+differ from Orbit's own environment are carried, so the set stays small and
+inspectable. Turn it off with `tools.persistentShell: false`.
+
+## Finding things
+
+`find_symbol` and `outline_file` **parse** the file rather than scanning it, for
+the 26 extensions covered by a bundled grammar — TypeScript, TSX, JavaScript,
+Python, Rust, Go, Java, C#, C/C++, Ruby, PHP, Bash, CSS, PowerShell.
+
+That means a declaration inside a block comment or a template string is not a
+declaration, `private` really means private, and Go's capital letter and Python's
+leading underscore are read the way each language means them:
+
+```
+› /help find_symbol
+
+  src/auth.ts:12  [function, exported] signIn
+      export function signIn(user: string) {
+
+  2 declarations of "signIn" (searched 148 files, parsed)
+```
+
+The grammars are pre-built WASM, so there is no native compilation and an install
+behaves the same on Windows, macOS and Linux. They are also ~22 MB, so they are
+an **optional dependency**: if the bundle is missing, everything falls back to
+the line scan and the output says `matched by pattern` instead of `parsed`. A
+language with no grammar takes the same path.
 
 ## Undo
 
@@ -627,6 +748,28 @@ allowed, and secret-shaped values are redacted from logs and from the UI.
 captured. When a model cannot accept images, Orbit says so rather than pretending
 to have looked.
 
+## Accepting part of a change
+
+A model that gets four things right and one thing wrong used to force an
+all-or-nothing decision. Press **P** at the approval prompt to review the change
+hunk by hunk:
+
+```
+  Edit src/auth.ts
+  Change      +18 −6
+
+  → [x] line 12  +4 -1   const token = await refresh(session)
+    [ ] line 88  +14 -5  export function retryForever(fn) {
+
+  space toggle · ↑↓ move · a all/none · enter apply 1 of 2 · esc back
+```
+
+The file is rebuilt from the hunks you kept, and the model is told plainly that
+the rest were rejected so it does not assume they landed. If the chosen hunks
+cannot be applied on their own — they overlap — the call is **refused** rather
+than half-applied: a file that is neither what the model proposed nor what you
+picked is the worst available outcome.
+
 ## Architecture
 
 ```
@@ -684,6 +827,26 @@ its contents are added to the system prompt.
 └── logs/                    only written with --debug, redacted
 ```
 
+### A broken config file does not lock you out
+
+One typo used to fail the whole load — including `orbit config`, which is what
+the error told you to run. Now each section is validated on its own:
+
+```
+Parts of ~/.orbit/config.json could not be used:
+  hooks.entries[1] — command: Required
+  providers.staging — baseURL: Invalid url
+  Those sections are running on defaults. Everything else loaded normally.
+  Fix the file, or run: orbit config
+```
+
+Two collections get finer treatment still, because they are lists you curate by
+hand: one bad hook does not discard the others, and one bad provider does not
+take the rest with it. Before anything overwrites the file, the original is
+copied to `config.json.invalid-<timestamp>` so a nearly-right section is never
+lost. Unparseable JSON is the one case with nothing to salvage — there is no way
+to guess what was meant.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -730,9 +893,11 @@ passing.
   instead of guessing at its contents.
 - MCP support is stdio transport only, and covers tools — not resources or
   prompts.
-- `find_symbol` is a lexical index, not a parser. It finds declarations reliably
-  in the languages listed above and nothing at all in the ones it does not know.
-- Cost estimates need rates you enter yourself. Orbit ships no price table.
+- `find_symbol` parses the languages it has a grammar for and falls back to a
+  line scan for the rest. Every result says which it was, so a scan is never
+  mistaken for a parse.
+- Cost estimates need rates you enter yourself, except where a provider
+  publishes them. Orbit ships no price table.
 - Checkpoints cover shell commands only inside a git work tree, since that is
   what makes capturing the whole tree cheap. In a plain directory, only the
   agent's own file tools are undoable.

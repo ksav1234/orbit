@@ -56,6 +56,18 @@ export async function httpErrorFor(response: Response, providerName: string): Pr
       hints: ['Verify the base URL.', 'Check the model id with: orbit model list'],
     });
   }
+  if (status === 402) {
+    // Out of credit is not a transient fault: retrying cannot fix it, and it is
+    // the clearest possible case for trying a different provider.
+    return new OrbitError(`${providerName} refused the request: no credit.`, {
+      kind: 'billing',
+      detail,
+      hints: [
+        'Top up the account, or switch provider with: /provider',
+        'Configure a fallback with: orbit failover add <provider>',
+      ],
+    });
+  }
   if (status === 429) {
     const retryAfter = response.headers.get('retry-after');
     return new OrbitError(`${providerName} rate limit reached.`, {

@@ -5,6 +5,7 @@ import { defineTool, toolError, toolOk, type Tool, type ToolContext } from './re
 import { walkFiles } from './search.js';
 import { looksBinary } from './filesystem.js';
 import { matchesGlob } from '../util/glob.js';
+import { isParsable, parseSymbols, parsingAvailable } from './treesitter.js';
 import { pluralize, truncateWidth } from '../util/format.js';
 
 export type SymbolKind =
@@ -151,18 +152,27 @@ export function extractSymbols(text: string, relativePath: string): SymbolHit[] 
   return hits;
 }
 
+/**
+ * Collect declarations across the workspace.
+ *
+ * Each file is parsed when a grammar exists for it, and pattern-matched
+ * otherwise. `parsed` counts the files that got the accurate treatment, so the
+ * tool can say which it used instead of implying more precision than it has.
+ */
 async function buildIndex(
   context: ToolContext,
   options: { glob?: string; onProgress?: (count: number) => void },
-): Promise<{ symbols: SymbolHit[]; files: number }> {
+): Promise<{ symbols: SymbolHit[]; files: number; parsed: number }> {
   const symbols: SymbolHit[] = [];
   let files = 0;
+  let parsed = 0;
 
   for await (const file of walkFiles(context.sandbox.root, context)) {
     if (context.signal.aborted || files >= MAX_FILES) break;
 
     const relative = path.relative(context.sandbox.root, file).split(path.sep).join('/');
-    if (!EXTENSION_FAMILY[path.extname(relative).toLowerCase()]) continue;
+    const extension = path.extname(relative).toLowerCase();
+    if (!EXTENSION_FAMILY[extension] && !isParsable(relative)) continue;
     if (options.glob && !matchesGlob(relative, options.glob)) continue;
 
     let buffer: Buffer;
@@ -175,10 +185,18 @@ async function buildIndex(
 
     files++;
     if (files % 200 === 0) options.onProgress?.(files);
-    symbols.push(...extractSymbols(buffer.toString('utf8'), relative));
+
+    const text = buffer.toString('utf8');
+    const exact = await parseSymbols(text, relative);
+    if (exact) {
+      parsed++;
+      symbols.push(...exact);
+    } else {
+      symbols.push(...extractSymbols(text, relative));
+    }
   }
 
-  return { symbols, files };
+  return { symbols, files, parsed };
 }
 
 const findSymbolSchema = z.object({
@@ -205,10 +223,19 @@ export const findSymbolTool: Tool = defineTool({
   async execute(args, context) {
     context.progress('Indexing declarations…');
 
-    const { symbols, files } = await buildIndex(context, {
+    const { symbols, files, parsed } = await buildIndex(context, {
       glob: args.glob,
       onProgress: (count) => context.progress(`Indexed ${count} files…`),
     });
+
+    // How the answer was arrived at, so a lexical result is not mistaken for a
+    // parsed one.
+    const method =
+      parsed === files
+        ? 'parsed'
+        : parsed === 0
+          ? 'matched by pattern'
+          : `${parsed} of ${files} parsed, the rest matched by pattern`;
 
     const needle = args.name.toLowerCase();
     const matches = symbols
@@ -231,7 +258,7 @@ export const findSymbolTool: Tool = defineTool({
     if (matches.length === 0) {
       const summary = `No declaration of "${args.name}"`;
       return toolOk(
-        `${summary} found in ${pluralize(files, 'indexed file')}. It may be defined in a dependency, generated, or spelled differently — try search_files.`,
+        `${summary} found in ${pluralize(files, 'indexed file')} (${method}). It may be defined in a dependency, generated, or spelled differently — try search_files.`,
         { kind: 'matches', summary },
       );
     }
@@ -245,7 +272,7 @@ export const findSymbolTool: Tool = defineTool({
 
     const summary = `${pluralize(matches.length, 'declaration')} of "${truncateWidth(args.name, 30)}"`;
     return toolOk(
-      `${summary} (searched ${pluralize(files, 'file')})\n\n${rendered}`,
+      `${summary} (searched ${pluralize(files, 'file')}, ${method})\n\n${rendered}`,
       {
         kind: 'matches',
         summary,
@@ -253,7 +280,7 @@ export const findSymbolTool: Tool = defineTool({
         hiddenLines: Math.max(0, matches.length - 10),
         detail: rendered,
       },
-      { metadata: { matches: matches.length, filesIndexed: files } },
+      { metadata: { matches: matches.length, filesIndexed: files, filesParsed: parsed } },
     );
   },
 });
@@ -280,8 +307,11 @@ export const outlineFileTool: Tool = defineTool({
     }
     if (looksBinary(buffer)) return toolError(`${resolved.relative} is a binary file.`);
 
-    const symbols = extractSymbols(buffer.toString('utf8'), resolved.relative);
-    const lineCount = buffer.toString('utf8').split(/\r?\n/).length;
+    const text = buffer.toString('utf8');
+    // Parsed when a grammar covers the language, pattern-matched otherwise.
+    const parsedSymbols = await parseSymbols(text, resolved.relative);
+    const symbols = parsedSymbols ?? extractSymbols(text, resolved.relative);
+    const lineCount = text.split(/\r?\n/).length;
 
     if (symbols.length === 0) {
       return toolOk(
@@ -295,7 +325,7 @@ export const outlineFileTool: Tool = defineTool({
       .join('\n');
 
     return toolOk(
-      `${resolved.relative} (${pluralize(lineCount, 'line')})\n\n${rendered}`,
+      `${resolved.relative} (${pluralize(lineCount, 'line')}, ${parsedSymbols ? 'parsed' : 'matched by pattern'})\n\n${rendered}`,
       {
         kind: 'text',
         summary: `${resolved.relative} — ${pluralize(symbols.length, 'declaration')}`,

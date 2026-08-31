@@ -454,6 +454,14 @@ export const SLASH_COMMANDS: SlashCommand[] = [
               ],
             ] as Array<[string, string]>)
           : []),
+        ...(session.reasoningTokens > 0
+          ? ([
+              [
+                'Of that, thinking',
+                `${formatCount(session.reasoningTokens)} (${Math.round((session.reasoningTokens / Math.max(1, session.completionTokens)) * 100)}% of output)`,
+              ],
+            ] as Array<[string, string]>)
+          : []),
         ['Session cost', formatCost(sessionCost)],
         ['Requests', String(session.requests)],
         [
@@ -466,6 +474,9 @@ export const SLASH_COMMANDS: SlashCommand[] = [
         ],
         ['Lifetime in', formatCount(lifetime.promptTokens)],
         ['Lifetime out', formatCount(lifetime.completionTokens)],
+        ...(lifetime.reasoningTokens > 0
+          ? ([['Lifetime thinking', formatCount(lifetime.reasoningTokens)]] as Array<[string, string]>)
+          : []),
         ['Lifetime reqs', String(lifetime.requests)],
         ['Lifetime cost', formatCost(lifetimeCost)],
       ];

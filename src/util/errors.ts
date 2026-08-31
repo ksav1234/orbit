@@ -4,6 +4,7 @@ export type ErrorKind =
   | 'auth'
   | 'network'
   | 'rate-limit'
+  | 'billing'
   | 'permission'
   | 'sandbox'
   | 'tool'

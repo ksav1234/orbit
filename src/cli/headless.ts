@@ -159,11 +159,17 @@ export async function runHeadless(options: HeadlessOptions): Promise<HeadlessRes
     } else {
       if (answer) print(answer);
       if (options.verbose) {
-        printError(
-          ui.dim(
-            `\n${tools.length} tool calls · ${formatCount(usage.totalTokens)} tokens · ${turnReason}`,
-          ),
-        );
+        // Prompt/completion split and the thinking share, so a scripted run can
+        // account for what a reasoning model actually cost.
+        const parts = [
+          `${tools.length} tool calls`,
+          `${formatCount(usage.promptTokens)} in`,
+          `${formatCount(usage.completionTokens)} out`,
+        ];
+        if (usage.reasoningTokens) parts.push(`${formatCount(usage.reasoningTokens)} thinking`);
+        if (usage.cachedTokens) parts.push(`${formatCount(usage.cachedTokens)} cached`);
+        parts.push(turnReason);
+        printError(ui.dim(`\n${parts.join(' · ')}`));
       }
     }
     for (const entry of denied) {

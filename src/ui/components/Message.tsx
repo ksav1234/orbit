@@ -1,7 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import { useTheme } from '../context.js';
-import { truncateWidth } from '../../util/format.js';
+import { formatCount, truncateWidth } from '../../util/format.js';
 
 export interface UserMessageProps {
   text: string;
@@ -58,21 +58,85 @@ export function AssistantMessage({
 export interface ReasoningProps {
   text: string;
   columns: number;
+  /** Live estimate of what the thinking has cost so far, in tokens. */
+  tokens?: number;
 }
 
-/** Reasoning traces are dimmed and clipped: context, not content. */
-export function ReasoningTrace({ text, columns }: ReasoningProps): React.ReactElement | null {
+/**
+ * Reasoning traces are dimmed and clipped: context, not content.
+ *
+ * The token count beside it is what a long think is actually costing. While the
+ * stream is open the provider has not billed yet, so the figure is Orbit's own
+ * estimate of the text received so far and is marked `~`; the provider's real
+ * number replaces it once the request completes.
+ */
+export function ReasoningTrace({
+  text,
+  columns,
+  tokens,
+}: ReasoningProps): React.ReactElement | null {
   const theme = useTheme();
   if (!text.trim()) return null;
   const lines = text.trim().split('\n').slice(-3);
 
   return (
     <Box flexDirection="column" marginBottom={1}>
+      {tokens !== undefined && tokens > 0 && (
+        <Text color={theme.colors.muted} dimColor>
+          {`thinking ${theme.symbols.dot} ~${formatCount(tokens)} tokens`}
+        </Text>
+      )}
       {lines.map((line, index) => (
         <Text key={index} color={theme.colors.muted} dimColor italic>
           {truncateWidth(line, columns - 2)}
         </Text>
       ))}
+    </Box>
+  );
+}
+
+/**
+ * What one model request cost, printed into the transcript after it finishes.
+ *
+ * These are the provider's own numbers rather than an estimate, so the line
+ * appears only for providers that report usage, and `thinking` only for the
+ * ones that separate reasoning out.
+ */
+export function RequestCost({
+  promptTokens,
+  completionTokens,
+  reasoningTokens,
+  cachedTokens,
+  window: contextWindow,
+  used,
+  durationMs,
+}: {
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens?: number;
+  cachedTokens?: number;
+  window?: number;
+  used?: number;
+  durationMs?: number;
+}): React.ReactElement | null {
+  const theme = useTheme();
+  if (promptTokens === 0 && completionTokens === 0) return null;
+
+  const parts = [`up ${formatCount(promptTokens)}`, `down ${formatCount(completionTokens)}`];
+  if (reasoningTokens) parts.push(`${formatCount(reasoningTokens)} thinking`);
+  if (cachedTokens) parts.push(`${formatCount(cachedTokens)} cached`);
+  if (used !== undefined && contextWindow) {
+    parts.push(`${formatCount(used)}/${formatCount(contextWindow)} ctx`);
+  }
+  if (durationMs !== undefined && durationMs > 0) {
+    parts.push(`${(durationMs / 1000).toFixed(1)}s`);
+  }
+
+  return (
+    <Box marginBottom={1}>
+      <Text color={theme.colors.muted} dimColor>
+        {`  ${parts.join(`  ${theme.symbols.dot}  `)}`}
+      </Text>
     </Box>
   );
 }

@@ -18,6 +18,8 @@ export interface TurnUsage {
   completionTokens: number;
   /** Prompt tokens served from the provider's cache, where reported. */
   cachedTokens?: number;
+  /** Completion tokens spent thinking, where the provider separates them. */
+  reasoningTokens?: number;
   /** Response budget the optimizer granted for this request. */
   budgetTokens?: number;
   durationMs?: number;
@@ -27,6 +29,8 @@ export interface ModelUsage {
   promptTokens: number;
   completionTokens: number;
   cachedTokens: number;
+  /** Part of completionTokens that the model spent thinking. */
+  reasoningTokens: number;
   requests: number;
   firstUsed: string;
   lastUsed: string;
@@ -36,6 +40,8 @@ const ModelUsageSchema = z.object({
   promptTokens: z.number().default(0),
   completionTokens: z.number().default(0),
   cachedTokens: z.number().default(0),
+  // Defaulted, so usage files written before this existed still load.
+  reasoningTokens: z.number().default(0),
   requests: z.number().default(0),
   firstUsed: z.string().default(() => new Date().toISOString()),
   lastUsed: z.string().default(() => new Date().toISOString()),
@@ -53,6 +59,8 @@ export interface UsageTotals {
   completionTokens: number;
   /** Prompt tokens served from cache, included in promptTokens. */
   cachedTokens: number;
+  /** Completion tokens spent thinking, included in completionTokens. */
+  reasoningTokens: number;
   totalTokens: number;
   requests: number;
 }
@@ -108,6 +116,7 @@ export class UsageTracker {
       promptTokens: (existing?.promptTokens ?? 0) + turn.promptTokens,
       completionTokens: (existing?.completionTokens ?? 0) + turn.completionTokens,
       cachedTokens: (existing?.cachedTokens ?? 0) + (turn.cachedTokens ?? 0),
+      reasoningTokens: (existing?.reasoningTokens ?? 0) + (turn.reasoningTokens ?? 0),
       requests: (existing?.requests ?? 0) + 1,
       firstUsed: existing?.firstUsed ?? now,
       lastUsed: now,
@@ -122,10 +131,18 @@ export class UsageTracker {
         promptTokens: totals.promptTokens + turn.promptTokens,
         completionTokens: totals.completionTokens + turn.completionTokens,
         cachedTokens: totals.cachedTokens + (turn.cachedTokens ?? 0),
+        reasoningTokens: totals.reasoningTokens + (turn.reasoningTokens ?? 0),
         totalTokens: totals.totalTokens + turn.promptTokens + turn.completionTokens,
         requests: totals.requests + 1,
       }),
-      { promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, requests: 0 },
+      {
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: 0,
+        reasoningTokens: 0,
+        totalTokens: 0,
+        requests: 0,
+      },
     );
   }
 
@@ -135,10 +152,18 @@ export class UsageTracker {
         promptTokens: totals.promptTokens + model.promptTokens,
         completionTokens: totals.completionTokens + model.completionTokens,
         cachedTokens: totals.cachedTokens + (model.cachedTokens ?? 0),
+        reasoningTokens: totals.reasoningTokens + (model.reasoningTokens ?? 0),
         totalTokens: totals.totalTokens + model.promptTokens + model.completionTokens,
         requests: totals.requests + model.requests,
       }),
-      { promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, requests: 0 },
+      {
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: 0,
+        reasoningTokens: 0,
+        totalTokens: 0,
+        requests: 0,
+      },
     );
   }
 

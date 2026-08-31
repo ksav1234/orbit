@@ -433,8 +433,11 @@ export function toUsage(
         completion_tokens?: number;
         total_tokens?: number;
         prompt_tokens_details?: { cached_tokens?: number };
+        completion_tokens_details?: { reasoning_tokens?: number };
         prompt_cache_hit_tokens?: number;
         prompt_cache_miss_tokens?: number;
+        /** DeepSeek's spelling for the same figure. */
+        reasoning_tokens?: number;
       }
     | null
     | undefined,
@@ -448,11 +451,17 @@ export function toUsage(
   const cachedTokens =
     usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens;
 
+  // Reasoning models bill thinking as completion tokens but report it
+  // separately, which is the only way to show what a long think actually cost.
+  const reasoningTokens =
+    usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning_tokens;
+
   return {
     promptTokens: prompt,
     completionTokens: completion,
     totalTokens: usage.total_tokens ?? prompt + completion,
     ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    ...(reasoningTokens ? { reasoningTokens } : {}),
   };
 }
 

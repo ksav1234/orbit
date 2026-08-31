@@ -23,13 +23,21 @@ import {
 } from '../sessions/manager.js';
 import { createLogger } from '../util/logger.js';
 import { formatBytes } from '../util/format.js';
-import { AgentLoop, type AgentEvent, type TurnResult } from './loop.js';
+import {
+  AgentLoop,
+  type AgentEvent,
+  type FailoverGateway,
+  type ProviderChoice,
+  type TurnResult,
+} from './loop.js';
 import { Planner } from './planner.js';
 import { SUMMARIZER_PROMPT } from '../context/compaction.js';
 import { TokenOptimizer } from '../context/optimizer.js';
 import { UsageTracker } from '../context/usage.js';
 import { describeWindowSource, type WindowResolution, type WindowSource } from '../context/window.js';
 import type { HookPayload, HookRunner } from '../hooks/runner.js';
+import { ShellSession } from '../tools/shell-session.js';
+import { OrbitError } from '../util/errors.js';
 import { buildSystemPrompt, PROJECT_INSTRUCTION_FILES } from './prompts.js';
 
 const log = createLogger('agent');
@@ -71,6 +79,11 @@ export interface AgentOptions {
   detectWindow?: (provider: AIProvider, model: string) => Promise<WindowResolution | undefined>;
   /** User lifecycle hooks. Omit to run without any. */
   hooks?: HookRunner;
+  /**
+   * Build a provider by id, for failover. Returning undefined means the id is
+   * unusable (no key, bad config) and the next candidate is tried.
+   */
+  providerFor?: (id: string) => { provider: AIProvider; model: string; label: string } | undefined;
 }
 
 export type AgentListener = (event: AgentEvent) => void;
@@ -108,6 +121,33 @@ function filePathFromArgs(args: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Whether a failure is one a different provider could plausibly succeed at.
+ *
+ * A rejected request (bad tool schema, oversized prompt, unsupported image) is
+ * the request's fault and would be rejected again everywhere, so it never
+ * triggers a switch — that would just burn credit at a second provider to reach
+ * the same error more slowly.
+ */
+export function failoverApplies(error: OrbitError, triggers: readonly string[]): boolean {
+  switch (error.kind) {
+    case 'rate-limit':
+      return triggers.includes('rate-limit');
+    case 'billing':
+      return triggers.includes('billing');
+    case 'auth':
+      return triggers.includes('auth');
+    case 'network':
+      return triggers.includes('network');
+    case 'provider':
+      // `provider` covers both "server trouble" (retryable, worth switching)
+      // and "your request was wrong" (not).
+      return error.retryable && triggers.includes('server');
+    default:
+      return false;
+  }
+}
+
 export interface AttachmentNotice {
   kind: 'image' | 'pdf' | 'skipped';
   path: string;
@@ -132,6 +172,14 @@ export class Agent {
   private session: SessionRecord;
   private toolHistory: ToolHistoryEntry[] = [];
   private windowSource: WindowSource = 'name';
+  /**
+   * One shell session per agent, so `cd` in one command is still in effect for
+   * the next. A sub-agent gets its own, which keeps its exploration from moving
+   * the parent's shell out from under it.
+   */
+  private readonly shellSession: ShellSession;
+  /** Who the session started with, to return to after a failover. */
+  private readonly primary: { provider: AIProvider; model: string; label: string };
   private projectInstructions = '';
   private running = false;
 
@@ -150,6 +198,13 @@ export class Agent {
           model: options.model,
         },
       });
+
+    this.shellSession = new ShellSession(options.sandbox);
+    this.primary = {
+      provider: options.provider,
+      model: options.model,
+      label: options.providerLabel,
+    };
 
     const window = this.windowFor(options.provider, options.model);
     this.windowSource = window.source;
@@ -246,6 +301,58 @@ export class Agent {
     } catch {
       // Detection is an optimisation. The name-based window still works.
     }
+  }
+
+  // ── failover ─────────────────────────────────────────────────────────────
+
+  /**
+   * Offer the loop somewhere else to ask.
+   *
+   * Candidates are tried in configured order, each at most once per turn — a
+   * provider that just failed will fail again, and cycling between two dead
+   * providers would spin forever. A switch is permanent for the rest of the
+   * turn; whether it survives into the next one is `returnToPrimary`.
+   */
+  private failoverGateway(): FailoverGateway {
+    const tried = new Set<string>([this.options.provider.id]);
+
+    return {
+      next: (error: OrbitError) => {
+        const config = this.options.config.failover;
+        if (config.providers.length === 0) return undefined;
+        if (!failoverApplies(error, config.on)) return undefined;
+
+        for (const id of config.providers) {
+          if (tried.has(id)) continue;
+          tried.add(id);
+          const candidate = this.options.providerFor?.(id);
+          if (!candidate) {
+            log.debug('failover candidate unusable', { id });
+            continue;
+          }
+          return candidate;
+        }
+        return undefined;
+      },
+      onSwitch: (to: ProviderChoice) => {
+        // The rest of the session talks to the fallback, so the window, the
+        // session record and the status bar all have to follow it.
+        this.options = {
+          ...this.options,
+          provider: to.provider,
+          model: to.model,
+          providerLabel: to.label,
+        };
+        const window = this.windowFor(to.provider, to.model);
+        this.windowSource = window.source;
+        this.context.setContextWindow(
+          window.tokens,
+          responseReserveFor(window.tokens, this.options.config.agent.maxTokens),
+        );
+        this.session.provider = { id: to.provider.id, label: to.label, model: to.model };
+        this.refreshSystemPrompt();
+      },
+    };
   }
 
   // ── hooks ────────────────────────────────────────────────────────────────
@@ -411,6 +518,23 @@ export class Agent {
         this.session.title = titleFromPrompt(input, this.session.title);
       }
 
+      // A fallback taken last turn does not silently become the new default.
+      if (this.primary && this.options.config.failover.returnToPrimary) {
+        if (this.options.provider.id !== this.primary.provider.id) {
+          const back = this.primary;
+          this.options = {
+            ...this.options,
+            provider: back.provider,
+            model: back.model,
+            providerLabel: back.label,
+          };
+          this.emit({
+            type: 'notice',
+            message: `Back on ${back.label} for this turn.`,
+          });
+        }
+      }
+
       const loop = new AgentLoop({
         provider: this.options.provider,
         model: this.options.model,
@@ -429,7 +553,9 @@ export class Agent {
         emit: (event) => this.handleEvent(event),
         summarize: (transcript, signal) => this.summarize(transcript, signal),
         onToolExecuted: (name, result) => this.recordToolUse(name, result),
+        providerLabel: this.options.providerLabel,
         ...(this.options.hooks ? { hooks: this.hookGateway(this.options.hooks) } : {}),
+        ...(this.options.providerFor ? { failover: this.failoverGateway() } : {}),
       });
 
       await this.runHooks('turn-start', { turn: this.turnNumber() });
@@ -506,6 +632,7 @@ export class Agent {
       workspace: this.options.workspace,
       visionAvailable: this.visionAvailable,
       checkpoints: this.options.checkpoints,
+      shellSession: this.shellSession,
       fileTracker: this.fileTracker,
       background: this.options.background,
       web: {

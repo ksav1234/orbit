@@ -45,6 +45,7 @@ export type AgentEvent =
   | { type: 'retry'; attempt: number; delayMs: number; reason: string }
   | { type: 'notice'; message: string }
   | { type: 'context-window'; tokens: number; source: string; detail: string }
+  | { type: 'failover'; from: string; to: string; model: string; reason: string }
   | { type: 'checkpoint'; turn: number; files: number }
   | { type: 'error'; error: OrbitError }
   | { type: 'turn-end'; reason: TurnEndReason; iterations: number };
@@ -56,9 +57,25 @@ export interface TurnResult {
   error?: OrbitError;
 }
 
+/** Where the loop turns when the active provider will not answer. */
+export interface ProviderChoice {
+  provider: AIProvider;
+  model: string;
+  label: string;
+}
+
+export interface FailoverGateway {
+  /** The next provider to try, or undefined to give up and surface the error. */
+  next(error: OrbitError): ProviderChoice | undefined;
+  /** Called once a switch is decided, so the session can follow it. */
+  onSwitch(to: ProviderChoice, reason: string): void;
+}
+
 export interface AgentLoopDeps {
   provider: AIProvider;
   model: string;
+  /** Display name for the provider, used in failover messages. */
+  providerLabel?: string;
   context: ContextManager;
   registry: ToolRegistry;
   permissions: PermissionManager;
@@ -81,6 +98,12 @@ export interface AgentLoopDeps {
    * Lifecycle hooks around tool execution. `beforeTool` may veto the call by
    * returning a reason, which is reported to the model as a denial.
    */
+  /**
+   * Somewhere else to ask when the active provider will not answer. Consulted
+   * only after retries are exhausted, and only for failures a different
+   * provider could plausibly succeed at.
+   */
+  failover?: FailoverGateway;
   hooks?: {
     beforeTool(call: ToolCall, args: unknown, signal: AbortSignal): Promise<string | undefined>;
     afterTool(call: ToolCall, args: unknown, result: ToolResult, signal: AbortSignal): Promise<void>;
@@ -94,12 +117,24 @@ export interface AgentLoopDeps {
 export class AgentLoop {
   private readonly deps: AgentLoopDeps;
   private readonly usage: Usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  /** Who is answering right now. Changes only through failover. */
+  private active: { provider: AIProvider; model: string; label: string };
   /** Response budget granted for the request currently in flight. */
   private responseBudget: number;
 
   constructor(deps: AgentLoopDeps) {
     this.deps = deps;
     this.responseBudget = deps.config.maxTokens;
+    this.active = {
+      provider: deps.provider,
+      model: deps.model,
+      label: deps.providerLabel ?? deps.provider.name,
+    };
+  }
+
+  /** Who answered, which is not always who was asked. */
+  activeProvider(): { provider: AIProvider; model: string; label: string } {
+    return this.active;
   }
 
   async run(signal: AbortSignal): Promise<TurnResult> {
@@ -135,11 +170,12 @@ export class AgentLoop {
             type: 'turn-usage',
             turn: {
               at: new Date().toISOString(),
-              model: this.deps.model,
-              provider: this.deps.provider.name,
+              model: this.active.model,
+              provider: this.active.label,
               promptTokens: response.usage.promptTokens,
               completionTokens: response.usage.completionTokens,
               cachedTokens: response.usage.cachedTokens,
+              reasoningTokens: response.usage.reasoningTokens,
               budgetTokens: this.responseBudget,
               durationMs: Date.now() - startedAt,
             },
@@ -187,7 +223,7 @@ export class AgentLoop {
       return this.finish('max-iterations', iterations);
     } catch (error) {
       if (isCancellation(error)) return this.finish('cancelled', iterations);
-      const friendly = toFriendlyError(error, { provider: this.deps.provider.name });
+      const friendly = toFriendlyError(error, { provider: this.active.label });
       log.error('agent loop failed', { message: friendly.message, detail: friendly.detail });
       emit({ type: 'error', error: friendly });
       return { reason: 'error', iterations, usage: { ...this.usage }, error: friendly };
@@ -206,7 +242,10 @@ export class AgentLoop {
   }
 
   private nativeToolsAvailable(): boolean {
-    return this.deps.provider.supportsTools(this.deps.model) && this.deps.registry.list().length > 0;
+    // The active provider, which after a failover is not the one in deps.
+    return (
+      this.active.provider.supportsTools(this.active.model) && this.deps.registry.list().length > 0
+    );
   }
 
   /**
@@ -253,9 +292,42 @@ export class AgentLoop {
     context.enforceHardLimit(tools);
   }
 
-  /** One streamed model call, with retries for transient provider failures. */
+  /**
+   * One streamed model call: retries for transient faults, then a different
+   * provider for faults that retrying cannot fix.
+   *
+   * The conversation itself is provider-agnostic, so a switch mid-turn keeps
+   * every message and tool result already gathered. What does change is whether
+   * native tool calling is available, so that is recomputed per candidate.
+   */
   private async requestModel(signal: AbortSignal): Promise<ChatResponse> {
-    const { provider, model, context, registry, config, emit } = this.deps;
+    for (;;) {
+      try {
+        return await this.requestOnce(signal);
+      } catch (error) {
+        if (isCancellation(error) || signal.aborted) throw error;
+        if (!(error instanceof OrbitError)) throw error;
+
+        const next = this.deps.failover?.next(error);
+        if (!next) throw error;
+
+        const from = this.active.label;
+        this.active = next;
+        this.deps.failover?.onSwitch(next, error.message);
+        this.deps.emit({
+          type: 'failover',
+          from,
+          to: next.label,
+          model: next.model,
+          reason: error.message,
+        });
+      }
+    }
+  }
+
+  private async requestOnce(signal: AbortSignal): Promise<ChatResponse> {
+    const { context, registry, config, emit } = this.deps;
+    const { provider, model } = this.active;
     const useNativeTools = this.nativeToolsAvailable();
 
     return retry(
@@ -406,6 +478,9 @@ export class AgentLoop {
         };
       }
 
+      let effectiveArgs = args;
+      let partialNote: string | undefined;
+
       if (request) {
         const decision = await permissions.check(request);
         if (!decision.granted) {
@@ -420,9 +495,38 @@ export class AgentLoop {
           });
           continue;
         }
+
+        // The user accepted some of the change. The tool rewrites its own
+        // arguments to match, because only it knows how they map onto the file.
+        if (decision.choice === 'partial' && decision.selectedHunks && tool.narrow) {
+          const narrowed = await tool.narrow(args, decision.selectedHunks, toolContext);
+          if (narrowed === null) {
+            // Refuse rather than write something that is neither what the model
+            // proposed nor what the user picked.
+            const reason =
+              'The selected changes could not be applied on their own — they overlap. Propose them separately.';
+            prepared.push({
+              call,
+              tool,
+              args,
+              readOnly: tool.readOnly,
+              failure: toolError(`Permission denied. ${reason}`, { summary: 'partial apply failed' }),
+              denialReason: reason,
+            });
+            continue;
+          }
+          effectiveArgs = narrowed;
+          partialNote = decision.reason;
+        }
       }
 
-      prepared.push({ call, tool, args, readOnly: tool.readOnly });
+      prepared.push({
+        call,
+        tool,
+        args: effectiveArgs,
+        readOnly: tool.readOnly,
+        ...(partialNote ? { partialNote } : {}),
+      });
     }
 
     if (signal.aborted) return 'cancelled';
@@ -481,6 +585,8 @@ export class AgentLoop {
       readOnly: boolean;
       failure?: ToolResult;
       denialReason?: string;
+      /** Told to the model when only part of a proposed change was accepted. */
+      partialNote?: string;
     },
     signal: AbortSignal,
   ): Promise<{ images?: ContentPart[]; names: string[] }> {
@@ -508,7 +614,7 @@ export class AgentLoop {
       return { names: [] };
     }
 
-    return this.runOne(item.tool!, item.call, item.args, signal);
+    return this.runOne(item.tool!, item.call, item.args, signal, item.partialNote);
   }
 
   private async runOne(
@@ -516,6 +622,7 @@ export class AgentLoop {
     call: ToolCall,
     args: unknown,
     signal: AbortSignal,
+    partialNote?: string,
   ): Promise<{ images?: ContentPart[]; names: string[] }> {
     const { emit, context } = this.deps;
     emit({ type: 'tool-start', call, readOnly: tool.readOnly });
@@ -562,7 +669,12 @@ export class AgentLoop {
     // the file by the time the model reads about it.
     if (this.deps.hooks) await this.deps.hooks.afterTool(call, args, result, signal);
 
-    context.addToolResult(call, result.content);
+    // The model has to know it got less than it asked for, or it will assume the
+    // rest landed and build on it.
+    context.addToolResult(
+      call,
+      partialNote ? `${result.content}\n\n${partialNote}` : result.content,
+    );
 
     const images = result.images?.length ? result.images : undefined;
     return {

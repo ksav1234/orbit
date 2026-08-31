@@ -6,6 +6,7 @@ import { defineTool, toolError, toolOk, type Tool, type ToolContext, type ToolRe
 import { targetForFile } from '../permissions/manager.js';
 import { SandboxError } from '../util/errors.js';
 import { applyEol, detectEol, normalizeEol, unifiedDiff } from '../util/diff.js';
+import { applyHunks, splitHunks } from '../util/hunks.js';
 import { staleWriteMessage } from './tracker.js';
 import { clampChars, formatBytes, pluralize } from '../util/format.js';
 
@@ -245,9 +246,24 @@ export const writeFileTool: Tool = defineTool({
       ],
       preview: diff,
       previewKind: 'diff',
+      // A new file is one change; there is nothing to pick from.
+      ...(isNew ? {} : { hunks: splitHunks(existing, args.content) }),
       target: targetForFile(context.sandbox.root, resolved.absolute),
       sensitive: resolved.sensitive,
     };
+  },
+  /**
+   * Rewrite `content` to hold only the accepted hunks. The file on disk is read
+   * again rather than trusting the copy from the prompt, so an edit made in the
+   * meantime is caught by the staleness check instead of being overwritten.
+   */
+  async narrow(args, selectedHunks, context) {
+    const resolved = context.sandbox.resolve(args.path);
+    const existing = await readIfExists(resolved.absolute);
+    if (existing === null) return null;
+    const narrowed = applyHunks(existing, args.content, selectedHunks);
+    if (narrowed === undefined) return null;
+    return { ...args, content: narrowed };
   },
   async execute(args, context) {
     const resolved = await context.sandbox.resolveReal(args.path);
@@ -324,8 +340,32 @@ export const editFileTool: Tool = defineTool({
       ],
       preview: diff.patch,
       previewKind: 'diff',
+      hunks: splitHunks(existing, applied.text),
       target: targetForFile(context.sandbox.root, resolved.absolute),
       sensitive: resolved.sensitive,
+    };
+  },
+  /**
+   * An edit narrowed to some of its hunks is no longer a find-and-replace, so
+   * it becomes an exact substitution of the file's current text for the
+   * partially-applied text. That keeps `old_string`/`new_string` semantics
+   * honest: the tool still replaces one exact string, just a different one.
+   */
+  async narrow(args, selectedHunks, context) {
+    const resolved = context.sandbox.resolve(args.path);
+    const existing = await readIfExists(resolved.absolute);
+    if (existing === null) return null;
+    const applied = applyEdit(existing, args.old_string, args.new_string, args.replace_all);
+    if (!applied.ok) return null;
+
+    const narrowed = applyHunks(existing, applied.text, selectedHunks);
+    if (narrowed === undefined || narrowed === existing) return null;
+
+    return {
+      ...args,
+      old_string: normalizeEol(existing),
+      new_string: narrowed,
+      replace_all: false,
     };
   },
   async execute(args, context) {

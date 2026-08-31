@@ -1,5 +1,6 @@
 import path from 'node:path';
 import type { PermissionDecision, PermissionPolicy } from '../config/schema.js';
+import type { Hunk } from '../util/hunks.js';
 import { createLogger } from '../util/logger.js';
 
 const log = createLogger('permissions');
@@ -23,19 +24,29 @@ export interface PermissionRequest {
   /** Destructive requests never offer a session-wide grant. */
   destructive?: boolean;
   /**
+   * The proposed change broken into separately acceptable pieces. When present,
+   * the prompt offers to apply a subset instead of all-or-nothing.
+   */
+  hunks?: Hunk[];
+  /**
    * Set when the target matched a sensitive-file pattern. These always prompt,
    * even if the category policy is `allow`.
    */
   sensitive?: boolean;
 }
 
-export type PermissionChoice = 'once' | 'session' | 'deny' | 'auto' | 'redirect';
+export type PermissionChoice = 'once' | 'session' | 'deny' | 'auto' | 'redirect' | 'partial';
 
 export interface PermissionResult {
   granted: boolean;
   choice: PermissionChoice;
   /** Explanation handed back to the model when denied. */
   reason?: string;
+  /**
+   * Hunk indices the user accepted, when they approved only part of a change.
+   * The tool narrows its own arguments to these.
+   */
+  selectedHunks?: number[];
 }
 
 /** The UI supplies this; it renders the prompt and resolves with the choice. */
@@ -184,6 +195,28 @@ export class PermissionManager {
           : 'The user rejected this and wants a different approach.',
       };
     }
+    if (choice === 'partial') {
+      const selected = this.lastHunkSelection ?? [];
+      if (selected.length === 0) {
+        // Choosing nothing is a refusal, and saying so plainly beats writing an
+        // unchanged file and calling it a success.
+        return {
+          granted: false,
+          choice: 'deny',
+          reason: 'The user reviewed the change and accepted none of it.',
+        };
+      }
+      const total = request.hunks?.length ?? 0;
+      return {
+        granted: true,
+        choice,
+        selectedHunks: selected,
+        reason:
+          total > 0 && selected.length < total
+            ? `The user accepted ${selected.length} of ${total} changes. The rest were rejected — do not reapply them without asking.`
+            : undefined,
+      };
+    }
     if (choice === 'session' && !request.destructive) {
       this.sessionGrants.add(request.target ? this.grantKey(request) : this.wildcardKey(request));
     }
@@ -195,6 +228,13 @@ export class PermissionManager {
 
   setRedirect(instruction: string | null): void {
     this.lastRedirect = instruction?.trim() || null;
+  }
+
+  /** Hunks the UI's per-hunk picker settled on, read by the next `check`. */
+  private lastHunkSelection: number[] | null = null;
+
+  setHunkSelection(indices: number[] | null): void {
+    this.lastHunkSelection = indices ? [...indices] : null;
   }
 
   /** Consult auto mode's rule, counting the approvals it grants. */

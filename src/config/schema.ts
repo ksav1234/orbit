@@ -75,6 +75,14 @@ export const ToolsConfigSchema = z.object({
   allowedCommands: z.array(z.string()).default([]),
   /** Refuse a write when the file changed on disk since the agent read it. */
   detectStaleWrites: z.boolean().default(true),
+  /**
+   * Carry `cd` and exported variables from one shell command to the next.
+   *
+   * Each command still runs in its own process — only the resulting directory
+   * and environment persist — so exit codes, timeouts and cancellation are
+   * unaffected. A directory outside the workspace is never adopted.
+   */
+  persistentShell: z.boolean().default(true),
 });
 export type ToolsConfig = z.infer<typeof ToolsConfigSchema>;
 
@@ -91,6 +99,11 @@ export const UiConfigSchema = z.object({
   theme: ThemeNameSchema.default('orbit'),
   /** Play the launch animation. Ignored when stdout is not a terminal. */
   animation: z.boolean().default(true),
+  /**
+   * Print what each model request cost — prompt, completion, thinking tokens,
+   * cache hits and context in use — into the transcript as it happens.
+   */
+  requestCost: z.boolean().default(true),
 });
 export type UiConfig = z.infer<typeof UiConfigSchema>;
 
@@ -300,6 +313,31 @@ export const HooksConfigSchema = z.object({
 });
 export type HooksConfig = z.infer<typeof HooksConfigSchema>;
 
+/** Failure classes worth asking a different provider about. */
+export const FAILOVER_TRIGGERS = ['rate-limit', 'billing', 'server', 'auth', 'network'] as const;
+export const FailoverTriggerSchema = z.enum(FAILOVER_TRIGGERS);
+export type FailoverTrigger = z.infer<typeof FailoverTriggerSchema>;
+
+/**
+ * What to do when the active provider will not answer.
+ *
+ * Off until a fallback is named, because switching provider mid-turn changes
+ * which model wrote the rest of the answer — worth doing, never worth doing
+ * silently. Every switch is announced in the transcript.
+ */
+export const FailoverConfigSchema = z.object({
+  /** Provider ids to try, in order, after the active one fails. */
+  providers: z.array(z.string()).default([]),
+  /** Which failures trigger a switch. A 400 never does: the request is at fault. */
+  on: z.array(FailoverTriggerSchema).default(['rate-limit', 'billing', 'server']),
+  /**
+   * Go back to the primary at the start of the next turn, rather than staying on
+   * the fallback for the rest of the session.
+   */
+  returnToPrimary: z.boolean().default(true),
+});
+export type FailoverConfig = z.infer<typeof FailoverConfigSchema>;
+
 export const ConfigSchema = z.object({
   version: z.literal(1).default(1),
   activeProvider: z.string().optional(),
@@ -314,6 +352,7 @@ export const ConfigSchema = z.object({
   subagents: SubagentConfigSchema.default({}),
   pricing: PricingConfigSchema.default({}),
   tools: ToolsConfigSchema.default({}),
+  failover: FailoverConfigSchema.default({}),
   hooks: HooksConfigSchema.default({}),
   ui: UiConfigSchema.default({}),
   sessions: SessionsConfigSchema.default({}),

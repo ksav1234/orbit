@@ -11,6 +11,10 @@ export interface ScriptedTurn {
   toolCalls?: ScriptedToolCall[];
   /** Split the text into this many stream chunks (default: word by word). */
   chunkSize?: number;
+  /** Report this many completion tokens as reasoning, as a thinking model does. */
+  reasoningTokens?: number;
+  /** Report this many prompt tokens as cache hits. */
+  cachedTokens?: number;
   /** Emit an HTTP error instead of a normal response. */
   httpStatus?: number;
   body?: string;
@@ -119,7 +123,19 @@ export async function startMockProvider(turns: ScriptedTurn[]): Promise<MockProv
       send({
         ...base,
         choices: [],
-        usage: { prompt_tokens: 100, completion_tokens: 25, total_tokens: 125 },
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 25,
+          total_tokens: 125,
+          // Reasoning models report the thinking share separately; including it
+          // here keeps the token-accounting path exercised end to end.
+          ...(turn.reasoningTokens !== undefined
+            ? { completion_tokens_details: { reasoning_tokens: turn.reasoningTokens } }
+            : {}),
+          ...(turn.cachedTokens !== undefined
+            ? { prompt_tokens_details: { cached_tokens: turn.cachedTokens } }
+            : {}),
+        },
       });
 
       res.write('data: [DONE]\n\n');

@@ -8,8 +8,8 @@ import { App } from './cli/app.js';
 import { runConfigScreen, runProviderWizard } from './cli/setup.js';
 import { confirm, isInteractive, print, printError, table, ui } from './cli/prompt.js';
 import { loadConfig, type ConfigManager } from './config/manager.js';
-import { HOOK_EVENTS, PROVIDER_PRESETS, presetById } from './config/schema.js';
-import { createProvider } from './providers/factory.js';
+import { HOOK_EVENTS, PROVIDER_PRESETS, presetById, type PricingEntry } from './config/schema.js';
+import { createProvider, isLocalEndpoint } from './providers/factory.js';
 import type { AIProvider } from './providers/provider.js';
 import { PermissionManager } from './permissions/manager.js';
 import { Sandbox } from './permissions/sandbox.js';
@@ -21,6 +21,15 @@ import { Agent } from './agent/agent.js';
 import { Planner, createPlanTool } from './agent/planner.js';
 import { AutoMode } from './agent/autopilot.js';
 import { UsageTracker } from './context/usage.js';
+import {
+  FREE,
+  describePrice,
+  fetchCataloguePricing,
+  isLocalProvider,
+  matchCatalogueModel,
+  mergePricing,
+  type DiscoveredPrice,
+} from './context/pricing.js';
 import { HookRunner, describeHook, hookMatchesTool } from './hooks/runner.js';
 import {
   WindowCache,
@@ -68,6 +77,8 @@ const VALUE_FLAGS = new Set(['model', 'provider', 'prompt', 'output', 'theme']);
 const COMMANDS = new Set([
   'config',
   'hooks',
+  'pricing',
+  'failover',
   'provider',
   'model',
   'web',
@@ -170,6 +181,8 @@ function showHelp(): void {
   print('  orbit web [key|on|off]       Web search access (Tavily)');
   print('  orbit mcp <cmd>              list | add <id> <cmd> | remove <id> | test [id]');
   print('  orbit hooks [test <n>]       Lifecycle hooks: list them, or try one out');
+  print('  orbit pricing <cmd>          list | import | set <key> <in> <out> | clear');
+  print('  orbit failover <cmd>         list | add <id> | remove <id> | off');
   print('  orbit model context [<n>]    Show, resize (up/down/+50k), or re-detect the window');
   print();
   print(ui.title('Options'));
@@ -942,6 +955,28 @@ async function startInteractive(options: StartOptions): Promise<number> {
     resolveWindow: windowFor,
     detectWindow: detectWindowFor,
     hooks,
+    /**
+     * Build a fallback provider on demand. A provider with no key is not a
+     * candidate: switching to it would swap one failure for another.
+     */
+    providerFor: (id) => {
+      const target = config.getProvider(id);
+      if (!target?.model) return undefined;
+      if (!config.hasApiKey(id) && !isLocalEndpoint(target.baseURL)) return undefined;
+      try {
+        return {
+          provider: createProvider({
+            config: target,
+            apiKey: config.apiKey(id),
+            model: target.model,
+          }),
+          model: target.model,
+          label: target.label,
+        };
+      } catch {
+        return undefined;
+      }
+    },
   });
   await agent.initialize();
 
@@ -978,6 +1013,26 @@ async function startInteractive(options: StartOptions): Promise<number> {
       }
     }
   });
+
+  for (const issue of config.validationIssues()) {
+    warnings.push(
+      `Config section "${issue.section}" was unusable and is running on defaults (${issue.message}).`,
+    );
+  }
+
+  const failover = config.get().failover;
+  if (failover.providers.length > 0) {
+    const usable = failover.providers.filter(
+      (id) => config.getProvider(id) && (config.hasApiKey(id) || isLocalEndpoint(config.getProvider(id)!.baseURL)),
+    );
+    if (usable.length === 0) {
+      warnings.push(
+        `Failover lists ${failover.providers.join(', ')}, but none are usable (missing provider or key).`,
+      );
+    } else {
+      warnings.push(`Failover ready: ${usable.join(' → ')} if ${providerConfig.label} fails.`);
+    }
+  }
 
   if (hooks.count() > 0) {
     warnings.push(
@@ -1060,6 +1115,7 @@ async function startInteractive(options: StartOptions): Promise<number> {
       autoMode,
       theme,
       showBanner: options.showBanner,
+      showRequestCost: runtimeConfig.ui.requestCost,
       // An intro is only worth playing to a human watching a real terminal.
       animate:
         (options.animate ?? true) &&
@@ -1233,6 +1289,270 @@ async function hooksCommand(config: ConfigManager, args: string[]): Promise<numb
   return 1;
 }
 
+/**
+ * Show and fill in model rates.
+ *
+ * Orbit still ships no rate table — prices change and a stale number is worse
+ * than none. What it can do is ask: OpenRouter publishes machine-readable
+ * prices, and a local endpoint costs nothing by definition. Everything else is
+ * typed in, and every rate says where it came from.
+ */
+async function pricingCommand(config: ConfigManager, args: string[]): Promise<number> {
+  const [action, ...rest] = args;
+  const pricing = config.get().pricing;
+
+  if (!action || action === 'list') {
+    const entries = Object.entries(pricing);
+    print();
+    print(ui.title('Model pricing'));
+    print();
+    if (entries.length === 0) {
+      print(ui.dim('  No rates set, so /usage shows token counts without costs.'));
+      print();
+      print(ui.dim('  orbit pricing import          fill in what the provider publishes'));
+      print(ui.dim('  orbit pricing set <key> <in> <out>   enter a rate yourself'));
+      print();
+      return 0;
+    }
+    const width = Math.max(...entries.map(([key]) => key.length));
+    for (const [key, entry] of entries) {
+      print(`  ${ui.value(key.padEnd(width))}  ${ui.dim(describePrice(entry))}`);
+    }
+    print();
+    print(ui.dim('  Costs appear in /usage and in `orbit config`.'));
+    print();
+    return 0;
+  }
+
+  if (action === 'set') {
+    const [key, input, output, currency] = rest;
+    const inputPerMillion = Number(input);
+    const outputPerMillion = Number(output);
+    if (!key || !Number.isFinite(inputPerMillion) || !Number.isFinite(outputPerMillion)) {
+      printError(ui.error('Usage: orbit pricing set <Provider:model> <input> <output> [currency]'));
+      print(ui.dim('  Prices are per million tokens, as vendors quote them.'));
+      print(ui.dim('  Example: orbit pricing set "DeepSeek:deepseek-chat" 0.27 1.10'));
+      return 1;
+    }
+    await config.update((draft) => {
+      draft.pricing[key] = {
+        inputPerMillion,
+        outputPerMillion,
+        currency: (currency ?? 'USD').toUpperCase(),
+      };
+    });
+    print(ui.ok(`${key}: ${describePrice(config.get().pricing[key]!)}`));
+    return 0;
+  }
+
+  if (action === 'clear') {
+    const key = rest[0];
+    await config.update((draft) => {
+      if (key) delete draft.pricing[key];
+      else draft.pricing = {};
+    });
+    print(ui.ok(key ? `Cleared the rate for ${key}.` : 'Cleared every rate.'));
+    return 0;
+  }
+
+  if (action === 'import') {
+    const target = rest[0] ? config.getProvider(rest[0]) : config.activeProvider();
+    if (!target) {
+      printError(ui.error('No provider to import for. Run: orbit provider add'));
+      return 1;
+    }
+
+    print(ui.dim(`Asking ${target.label} what it charges…`));
+    let catalogue = new Map<string, PricingEntry>();
+    let askFailed: string | undefined;
+    try {
+      catalogue = await fetchCataloguePricing({
+        baseURL: target.baseURL,
+        apiKey: config.apiKey(target.id),
+        providerName: target.label,
+      });
+    } catch (error) {
+      askFailed = errorMessage(error);
+    }
+
+    if (catalogue.size === 0) {
+      // Only now consider the endpoint's address. Asking first matters: a paid
+      // API reached through a proxy on localhost would otherwise be priced at
+      // zero on the strength of its hostname.
+      if (isLocalProvider(target.baseURL)) {
+        const models = [...new Set([target.model, ...target.models].filter(Boolean))] as string[];
+        await config.update((draft) => {
+          for (const model of models) draft.pricing[`${target.label}:${model}`] = FREE;
+        });
+        print(
+          ui.ok(
+            `${target.label} publishes no prices and runs on a local address — ${pluralize(models.length, 'model')} priced at zero.`,
+          ),
+        );
+        print(
+          ui.dim(
+            '  If that endpoint forwards to a paid API, set the real rate: orbit pricing set <key> <in> <out>',
+          ),
+        );
+        return 0;
+      }
+
+      printError(
+        ui.warn(
+          askFailed
+            ? `${target.label} does not publish prices (${askFailed}).`
+            : `${target.label} returned no prices.`,
+        ),
+      );
+      print(ui.dim('  Only OpenRouter-style catalogues do. Enter rates with:'));
+      print(ui.dim(`  orbit pricing set "${target.label}:${target.model ?? '<model>'}" <in> <out>`));
+      return 1;
+    }
+
+    // Only price the models this provider is actually configured with, rather
+    // than importing a catalogue of thousands.
+    const wanted = [...new Set([target.model, ...target.models].filter(Boolean))] as string[];
+    const found: DiscoveredPrice[] = [];
+    const missed: string[] = [];
+
+    for (const model of wanted) {
+      const match = matchCatalogueModel(model, catalogue);
+      if (!match) {
+        missed.push(model);
+        continue;
+      }
+      found.push({
+        key: `${target.label}:${model}`,
+        model,
+        entry: match.entry,
+        authority: match.id === model ? 'provider' : 'catalogue',
+      });
+    }
+
+    if (found.length === 0) {
+      printError(ui.warn(`None of ${target.label}'s configured models appear in its catalogue.`));
+      return 1;
+    }
+
+    await config.update((draft) => {
+      draft.pricing = mergePricing(draft.pricing, found);
+    });
+
+    print();
+    for (const price of found) {
+      print(`  ${ui.ok('set')} ${ui.value(price.key)}  ${ui.dim(describePrice(price.entry))}`);
+    }
+    if (missed.length > 0) {
+      print();
+      print(ui.dim(`  Not listed, so left unpriced: ${missed.join(', ')}`));
+    }
+    print();
+    print(ui.dim('  Thinking tokens are billed as output, and are counted there.'));
+    print();
+    return 0;
+  }
+
+  printError(ui.error(`Unknown pricing command "${action}". Try: list, import, set, clear.`));
+  return 1;
+}
+
+/**
+ * Manage the provider fallback chain.
+ *
+ * Deliberately a list of ids rather than a policy language: the useful question
+ * is "who else could answer this", and the answer is a provider you have already
+ * configured and paid for.
+ */
+async function failoverCommand(config: ConfigManager, args: string[]): Promise<number> {
+  const [action, target] = args;
+  const current = config.get().failover;
+  const active = config.get().activeProvider;
+
+  const describe = (id: string): string => {
+    const provider = config.getProvider(id);
+    if (!provider) return `${id}  ${ui.dim('(not configured)')}`;
+    const local = isLocalEndpoint(provider.baseURL);
+    const ready = config.hasApiKey(id) || local;
+    return `${id}  ${ui.dim(`${provider.model ?? 'no model'} · ${ready ? 'ready' : 'no key'}`)}`;
+  };
+
+  if (!action || action === 'list') {
+    print();
+    print(ui.title('Failover'));
+    print();
+    if (current.providers.length === 0) {
+      print(ui.dim('  Off. A request that fails is reported and the turn stops.'));
+      print();
+      print(ui.dim('  orbit failover add <provider>     try this one when the active provider fails'));
+      print(ui.dim('  orbit provider list               see the ids you have configured'));
+      print();
+      return 0;
+    }
+    print(`  ${ui.label('Active')}    ${ui.value(active ?? 'none')}`);
+    print(`  ${ui.label('Then')}      ${current.providers.map(describe).join(`
+            `)}`);
+    print(`  ${ui.label('When')}      ${ui.value(current.on.join(', '))}`);
+    print(
+      `  ${ui.label('Next turn')} ${ui.value(current.returnToPrimary ? 'back to the active provider' : 'stay on the fallback')}`,
+    );
+    print();
+    print(ui.dim('  A 400 never triggers a switch: the request is at fault, not the provider.'));
+    print();
+    return 0;
+  }
+
+  if (action === 'add') {
+    if (!target) {
+      printError(ui.error('Usage: orbit failover add <provider>'));
+      return 1;
+    }
+    if (!config.getProvider(target)) {
+      printError(ui.error(`No provider with id "${target}". See: orbit provider list`));
+      return 1;
+    }
+    if (target === active) {
+      printError(ui.error(`"${target}" is the active provider — it cannot fall back to itself.`));
+      return 1;
+    }
+    if (current.providers.includes(target)) {
+      print(ui.dim(`Already in the chain.`));
+      return 0;
+    }
+    await config.update((draft) => {
+      draft.failover.providers.push(target);
+    });
+    print(ui.ok(`Failover chain: ${config.get().failover.providers.join(' → ')}`));
+    if (!config.hasApiKey(target) && !isLocalEndpoint(config.getProvider(target)!.baseURL)) {
+      print(ui.warn(`  "${target}" has no key yet, so it would fail too. Run: orbit provider key ${target}`));
+    }
+    return 0;
+  }
+
+  if (action === 'remove') {
+    if (!target) {
+      printError(ui.error('Usage: orbit failover remove <provider>'));
+      return 1;
+    }
+    await config.update((draft) => {
+      draft.failover.providers = draft.failover.providers.filter((id) => id !== target);
+    });
+    const left = config.get().failover.providers;
+    print(ui.ok(left.length > 0 ? `Failover chain: ${left.join(' → ')}` : 'Failover is off.'));
+    return 0;
+  }
+
+  if (action === 'off' || action === 'clear') {
+    await config.update((draft) => {
+      draft.failover.providers = [];
+    });
+    print(ui.ok('Failover is off.'));
+    return 0;
+  }
+
+  printError(ui.error(`Unknown failover command "${action}". Try: list, add, remove, off.`));
+  return 1;
+}
+
 function reportStartupError(error: unknown): void {
   if (error instanceof OrbitError) {
     printError('');
@@ -1295,6 +1615,21 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return 1;
   }
 
+  // Say it once, before any command runs, so a reset section is never a silent
+  // surprise — and so it is visible even for commands that print nothing else.
+  const configIssues = config.validationIssues();
+  if (configIssues.length > 0) {
+    printError(ui.warn(`Parts of ${tildify(orbitPaths.config)} could not be used:`));
+    for (const issue of configIssues.slice(0, 6)) {
+      printError(ui.dim(`  ${issue.section} — ${issue.message}`));
+    }
+    printError(
+      ui.dim('  Those sections are running on defaults. Everything else loaded normally.'),
+    );
+    printError(ui.dim('  Fix the file, or run: orbit config'));
+    printError('');
+  }
+
   const sessions = new SessionManager();
 
   switch (command) {
@@ -1319,6 +1654,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return webCommand(config, positional);
     case 'hooks':
       return hooksCommand(config, positional);
+    case 'pricing':
+      return pricingCommand(config, positional);
+    case 'failover':
+      return failoverCommand(config, positional);
     case 'mcp':
       return mcpCommand(config, positional);
     case 'sessions':

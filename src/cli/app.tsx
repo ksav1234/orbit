@@ -32,9 +32,11 @@ import {
   Markdown,
   Notice,
   ReasoningTrace,
+  RequestCost,
   UserMessage,
   type NoticeTone,
 } from '../ui/components/Message.js';
+import { estimateTokens } from '../context/tokenizer.js';
 import { ToolCallView } from '../ui/components/ToolCall.js';
 import { PermissionPrompt, PermissionRecord } from '../ui/components/Permission.js';
 import { SelectPrompt, SecretPrompt, type SelectOption } from '../ui/components/Select.js';
@@ -72,8 +74,27 @@ type TranscriptItem =
       durationMs?: number;
       deniedReason?: string;
     }
-  | { kind: 'permission'; id: string; request: PermissionRequest; choice: PermissionChoice }
+  | {
+      kind: 'permission';
+      id: string;
+      request: PermissionRequest;
+      choice: PermissionChoice;
+      /** Set for a partial approval, so the transcript records what was kept. */
+      accepted?: number;
+      total?: number;
+    }
   | { kind: 'plan'; id: string; steps: PlanStep[] }
+  | {
+      kind: 'cost';
+      id: string;
+      promptTokens: number;
+      completionTokens: number;
+      reasoningTokens?: number;
+      cachedTokens?: number;
+      window: number;
+      used: number;
+      durationMs?: number;
+    }
   | { kind: 'error'; id: string; error: OrbitError };
 
 /** A modal owns the keyboard until it resolves. */
@@ -114,6 +135,8 @@ export interface AppProps {
   autoMode: AutoMode;
   theme: Theme;
   showBanner: boolean;
+  /** Print a token-cost line after each model request. */
+  showRequestCost?: boolean;
   /** Play the launch animation before settling into the banner. */
   animate?: boolean;
   debug: boolean;
@@ -148,7 +171,7 @@ export function App(props: AppProps): React.ReactElement {
   const [plan, setPlan] = useState<PlanStep[]>([]);
   const [pendingPermission, setPendingPermission] = useState<{
     request: PermissionRequest;
-    resolve: (choice: PermissionChoice, instruction?: string) => void;
+    resolve: (choice: PermissionChoice, instruction?: string, hunks?: number[]) => void;
   } | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [usedTokens, setUsedTokens] = useState(0);
@@ -298,9 +321,29 @@ export function App(props: AppProps): React.ReactElement {
           break;
 
         case 'usage':
-        case 'turn-usage':
           setUsedTokens(agent.context.budget(registry.definitions()).used);
           break;
+
+        case 'turn-usage': {
+          // One line per model request, with the provider's own figures. The
+          // live estimate shown during the stream is replaced by this.
+          const used = agent.context.budget(registry.definitions()).used;
+          setUsedTokens(used);
+          if (props.showRequestCost !== false) {
+            append({
+              kind: 'cost',
+              id: nextId('cost'),
+              promptTokens: event.turn.promptTokens,
+              completionTokens: event.turn.completionTokens,
+              ...(event.turn.reasoningTokens ? { reasoningTokens: event.turn.reasoningTokens } : {}),
+              ...(event.turn.cachedTokens ? { cachedTokens: event.turn.cachedTokens } : {}),
+              window: agent.context.getContextWindow(),
+              used,
+              ...(event.turn.durationMs ? { durationMs: event.turn.durationMs } : {}),
+            });
+          }
+          break;
+        }
 
         case 'optimization': {
           setPressure(event.decision.pressure);
@@ -326,6 +369,15 @@ export function App(props: AppProps): React.ReactElement {
 
         case 'notice':
           notice(event.message, 'warning');
+          break;
+
+        case 'failover':
+          // Never silent: which model wrote the rest of the answer changed.
+          notice(
+            `${event.from} failed (${event.reason}) — switched to ${event.to} · ${event.model}.`,
+            'warning',
+          );
+          setUsedTokens(agent.context.budget(registry.definitions()).used);
           break;
 
         case 'context-window':
@@ -393,12 +445,22 @@ export function App(props: AppProps): React.ReactElement {
       const gate = deferred<PermissionChoice>();
       setPendingPermission({
         request,
-        resolve: (choice, instruction) => {
+        resolve: (choice, instruction, hunks) => {
           setPendingPermission(null);
           // "Edit instruction" rejects the operation and tells the model what
           // the user wants instead, so the turn continues rather than stalling.
           permissions.setRedirect(choice === 'redirect' ? (instruction ?? null) : null);
-          append({ kind: 'permission', id: nextId('permission'), request, choice });
+          // "Pick changes" approves a subset; the tool narrows itself to it.
+          permissions.setHunkSelection(choice === 'partial' ? (hunks ?? []) : null);
+          append({
+            kind: 'permission',
+            id: nextId('permission'),
+            request,
+            choice,
+            ...(choice === 'partial'
+              ? { accepted: hunks?.length ?? 0, total: request.hunks?.length ?? 0 }
+              : {}),
+          });
           gate.resolve(choice);
         },
       });
@@ -994,7 +1056,7 @@ export function App(props: AppProps): React.ReactElement {
         {plan.length > 0 && <PlanView steps={plan} columns={columns} />}
 
         {reasoning && status === 'thinking' && (
-          <ReasoningTrace text={reasoning} columns={columns} />
+          <ReasoningTrace text={reasoning} columns={columns} tokens={estimateTokens(reasoning)} />
         )}
 
         {streamText && <AssistantMessage text={streamText} columns={columns} streaming />}
@@ -1121,9 +1183,29 @@ function TranscriptView({
         />
       );
     case 'permission':
-      return <PermissionRecord request={item.request} choice={item.choice} columns={columns} />;
+      return (
+        <PermissionRecord
+          request={item.request}
+          choice={item.choice}
+          accepted={item.accepted}
+          total={item.total}
+          columns={columns}
+        />
+      );
     case 'plan':
       return <PlanView steps={item.steps} columns={columns} />;
+    case 'cost':
+      return (
+        <RequestCost
+          promptTokens={item.promptTokens}
+          completionTokens={item.completionTokens}
+          reasoningTokens={item.reasoningTokens}
+          cachedTokens={item.cachedTokens}
+          window={item.window}
+          used={item.used}
+          durationMs={item.durationMs}
+        />
+      );
     case 'error':
       return <ErrorBox error={item.error} columns={columns} debug={debug} />;
     default:

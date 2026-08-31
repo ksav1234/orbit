@@ -6,6 +6,8 @@ import { registerSecret } from '../util/redact.js';
 import { createLogger } from '../util/logger.js';
 import {
   ConfigSchema,
+  HookSchema,
+  ProviderConfigSchema,
   defaultConfig,
   type OrbitConfig,
   type PermissionPolicy,
@@ -18,10 +20,115 @@ const log = createLogger('config');
 /** Credentials live in their own 0600 file so config.json stays safe to share. */
 type CredentialStore = Record<string, string>;
 
+/** A configuration section that could not be used, and why. */
+export interface ConfigIssue {
+  section: string;
+  message: string;
+}
+
+function firstMessage(error: { issues: Array<{ path: PropertyKey[]; message: string }> }): string {
+  const issue = error.issues[0];
+  if (!issue) return 'invalid';
+  const where = issue.path.map(String).join('.');
+  return where ? `${where}: ${issue.message}` : issue.message;
+}
+
+/**
+ * Rebuild a usable config from one that failed validation, keeping everything
+ * that parses.
+ *
+ * Sections are validated independently against their own schema, so a typo in
+ * `hooks` cannot take `providers` down with it. Two collections get finer
+ * treatment still, because they are lists the user curates by hand and losing
+ * all of them over one bad entry would be its own bug:
+ *
+ *   - `providers`, keyed by id — a broken provider is dropped, the rest stay.
+ *   - `hooks.entries`, an array — a broken hook is dropped, the rest still run.
+ */
+export function salvageConfig(input: unknown): { config: OrbitConfig; issues: ConfigIssue[] } {
+  const issues: ConfigIssue[] = [];
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return { config: defaultConfig(), issues: [{ section: 'root', message: 'not an object' }] };
+  }
+
+  const raw = input as Record<string, unknown>;
+  const shape = ConfigSchema.shape as Record<string, { safeParse(value: unknown): unknown }>;
+  const kept: Record<string, unknown> = {};
+
+  for (const [section, schema] of Object.entries(shape)) {
+    if (!(section in raw)) continue;
+    const result = schema.safeParse(raw[section]) as
+      | { success: true; data: unknown }
+      | { success: false; error: { issues: Array<{ path: PropertyKey[]; message: string }> } };
+
+    if (result.success) {
+      kept[section] = raw[section];
+      continue;
+    }
+
+    const rescued = salvageCollection(section, raw[section], issues);
+    if (rescued !== undefined) {
+      kept[section] = rescued;
+      continue;
+    }
+    issues.push({ section, message: firstMessage(result.error) });
+  }
+
+  const parsed = ConfigSchema.safeParse(kept);
+  if (parsed.success) return { config: parsed.data, issues };
+
+  // Something survived per-section validation but not the whole-object pass —
+  // a cross-field rule. Defaults are the only safe answer left.
+  issues.push({ section: 'root', message: firstMessage(parsed.error) });
+  return { config: defaultConfig(), issues };
+}
+
+/**
+ * Drop only the broken members of a hand-curated collection. Returns undefined
+ * when the section is not one of those, or when nothing could be rescued.
+ */
+function salvageCollection(
+  section: string,
+  value: unknown,
+  issues: ConfigIssue[],
+): unknown | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+
+  if (section === 'providers') {
+    const entries = Object.entries(value as Record<string, unknown>);
+    const good: Record<string, unknown> = {};
+    for (const [id, provider] of entries) {
+      const result = ProviderConfigSchema.safeParse(provider);
+      if (result.success) good[id] = provider;
+      else issues.push({ section: `providers.${id}`, message: firstMessage(result.error) });
+    }
+    return Object.keys(good).length > 0 ? good : undefined;
+  }
+
+  if (section === 'hooks') {
+    const record = value as { enabled?: unknown; entries?: unknown };
+    if (!Array.isArray(record.entries)) return undefined;
+    const good: unknown[] = [];
+    record.entries.forEach((hook, index) => {
+      const result = HookSchema.safeParse(hook);
+      if (result.success) good.push(hook);
+      else issues.push({ section: `hooks.entries[${index}]`, message: firstMessage(result.error) });
+    });
+    // Even zero surviving hooks is a rescue here: it keeps `enabled` and lets
+    // the rest of the config load.
+    return { ...(typeof record.enabled === 'boolean' ? { enabled: record.enabled } : {}), entries: good };
+  }
+
+  return undefined;
+}
+
 export class ConfigManager {
   private config: OrbitConfig = defaultConfig();
   private credentials: CredentialStore = {};
   private loaded = false;
+  private issues: ConfigIssue[] = [];
+  /** Whether the damaged original has already been copied aside. */
+  private backedUp = false;
 
   async load(): Promise<OrbitConfig> {
     await ensureOrbitHome();
@@ -33,35 +140,40 @@ export class ConfigManager {
   }
 
   private async readConfigFile(): Promise<OrbitConfig> {
+    let raw: string;
     try {
-      const raw = await fs.readFile(orbitPaths.config, 'utf8');
-      const parsed = ConfigSchema.safeParse(JSON.parse(raw));
-      if (!parsed.success) {
-        log.warn('config failed validation, falling back to defaults', {
-          issues: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
-        });
-        throw new OrbitError('Configuration file is invalid.', {
-          kind: 'config',
-          detail: parsed.error.issues
-            .slice(0, 4)
-            .map((i) => `${i.path.join('.') || 'root'}: ${i.message}`)
-            .join('; '),
-          hints: [`Fix or delete ${orbitPaths.config}`, 'Run: orbit config'],
-        });
-      }
-      return parsed.data;
+      raw = await fs.readFile(orbitPaths.config, 'utf8');
     } catch (error) {
-      if (error instanceof OrbitError) throw error;
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return defaultConfig();
-      if (error instanceof SyntaxError) {
-        throw new OrbitError('Configuration file is not valid JSON.', {
-          kind: 'config',
-          detail: error.message,
-          hints: [`Fix or delete ${orbitPaths.config}`],
-        });
-      }
       throw error;
     }
+
+    let json: unknown;
+    try {
+      json = JSON.parse(raw);
+    } catch (error) {
+      // Unparseable JSON is the one case with nothing to salvage: there is no
+      // way to tell which part the user meant.
+      throw new OrbitError('Configuration file is not valid JSON.', {
+        kind: 'config',
+        detail: error instanceof Error ? error.message : String(error),
+        hints: [`Fix or delete ${orbitPaths.config}`],
+      });
+    }
+
+    const parsed = ConfigSchema.safeParse(json);
+    if (parsed.success) return parsed.data;
+
+    // One bad section must not lock the user out of the whole CLI — including
+    // out of `orbit config`, which is what they would be told to run to fix it.
+    // Valid sections are kept, invalid ones fall back to their defaults, and
+    // exactly what was dropped is reported rather than silently swallowed.
+    const { config, issues } = salvageConfig(json);
+    this.issues = issues;
+    log.warn('config partly invalid; unusable sections reset', {
+      issues: issues.map((issue) => `${issue.section}: ${issue.message}`),
+    });
+    return config;
   }
 
   private async readCredentials(): Promise<CredentialStore> {
@@ -87,6 +199,29 @@ export class ConfigManager {
   }
 
   /** Apply a partial update, validate the result, and persist it. */
+  /** Sections that failed validation at load and were reset. Empty when clean. */
+  validationIssues(): ConfigIssue[] {
+    return this.issues;
+  }
+
+  /**
+   * Copy the damaged file aside before the first write that would overwrite it.
+   * The salvaged config is what gets saved, so without this the user's broken
+   * (but possibly nearly-right) section would be gone for good.
+   */
+  private async backupIfSalvaged(): Promise<void> {
+    if (this.backedUp || this.issues.length === 0) return;
+    this.backedUp = true;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const target = `${orbitPaths.config}.invalid-${stamp}`;
+    try {
+      await fs.copyFile(orbitPaths.config, target);
+      log.warn('kept a copy of the invalid config', { target });
+    } catch (error) {
+      log.warn('could not back up the invalid config', { error: String(error) });
+    }
+  }
+
   async update(mutate: (config: OrbitConfig) => void): Promise<OrbitConfig> {
     const draft: OrbitConfig = structuredClone(this.config);
     mutate(draft);
@@ -101,6 +236,7 @@ export class ConfigManager {
       });
     }
     this.config = parsed.data;
+    await this.backupIfSalvaged();
     await this.save();
     return this.config;
   }

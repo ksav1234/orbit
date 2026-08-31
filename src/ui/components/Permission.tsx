@@ -4,12 +4,15 @@ import { useTheme } from '../context.js';
 import { DiffView } from './DiffView.js';
 import type { PermissionChoice, PermissionRequest } from '../../permissions/manager.js';
 import { truncateWidth } from '../../util/format.js';
+import { describeHunk } from '../../util/hunks.js';
 
 export interface PermissionPromptProps {
   request: PermissionRequest;
   columns: number;
-  /** `instruction` is set only for the `redirect` choice. */
-  onDecide: (choice: PermissionChoice, instruction?: string) => void;
+  /**
+   * `instruction` is set only for `redirect`; `hunks` only for `partial`.
+   */
+  onDecide: (choice: PermissionChoice, instruction?: string, hunks?: number[]) => void;
 }
 
 /**
@@ -30,6 +33,12 @@ export function PermissionPrompt({
    * React re-renders, and a stale closure would drop them.
    */
   const instruction = useRef<string | null>(null);
+  /**
+   * Per-hunk review. Null when not reviewing; otherwise the cursor position and
+   * which hunks are currently accepted. Held in a ref for the same
+   * keystroke-race reason as the instruction editor.
+   */
+  const picker = useRef<{ cursor: number; accepted: Set<number> } | null>(null);
   const width = Math.min(columns - 2, 78);
   const inner = width - 2;
 
@@ -37,6 +46,13 @@ export function PermissionPrompt({
 
   const setInstruction = (value: string | null): void => {
     instruction.current = value;
+    forceRender();
+  };
+
+  const hunks = request.hunks ?? [];
+
+  const setPicker = (value: { cursor: number; accepted: Set<number> } | null): void => {
+    picker.current = value;
     forceRender();
   };
 
@@ -65,15 +81,55 @@ export function PermissionPrompt({
       return;
     }
 
+    // Per-hunk review: move, toggle, apply.
+    const review = picker.current;
+    if (review) {
+      const total = hunks.length;
+      if (key.escape) {
+        setPicker(null);
+        return;
+      }
+      if (key.return) {
+        onDecide('partial', undefined, [...review.accepted].sort((a, b) => a - b));
+        return;
+      }
+      if (key.upArrow || input === 'k') {
+        setPicker({ ...review, cursor: (review.cursor - 1 + total) % total });
+        return;
+      }
+      if (key.downArrow || input === 'j') {
+        setPicker({ ...review, cursor: (review.cursor + 1) % total });
+        return;
+      }
+      if (input === ' ') {
+        const accepted = new Set(review.accepted);
+        if (accepted.has(review.cursor)) accepted.delete(review.cursor);
+        else accepted.add(review.cursor);
+        setPicker({ ...review, accepted });
+        return;
+      }
+      if (input?.toLowerCase() === 'a') {
+        const all = review.accepted.size === total;
+        setPicker({ ...review, accepted: all ? new Set() : new Set(hunks.map((h) => h.index)) });
+        return;
+      }
+      return;
+    }
+
     const value = input.toLowerCase();
     if (value === 'y' || key.return) onDecide('once');
     else if (value === 'a' && allowSession) onDecide('session');
     else if (value === 'n' || key.escape) onDecide('deny');
     else if (value === 'e') setInstruction('');
-    else if (value === 'd' && request.preview) setShowPreview((v) => !v);
+    else if (value === 'p' && hunks.length > 1) {
+      // Everything starts accepted: the common case is rejecting one bad hunk,
+      // not rebuilding the change from nothing.
+      setPicker({ cursor: 0, accepted: new Set(hunks.map((h) => h.index)) });
+    } else if (value === 'd' && request.preview) setShowPreview((v) => !v);
   });
 
   const editing = instruction.current;
+  const reviewing = picker.current;
 
   const heading = request.destructive
     ? `${theme.symbols.warning} Destructive operation`
@@ -122,26 +178,79 @@ export function PermissionPrompt({
         </>
       )}
 
-      {request.preview && showPreview && (
+      {/* Per-hunk review replaces the diff: the same content, but addressable. */}
+      {reviewing ? (
         <>
           <Row theme={theme} width={inner} />
-          {request.previewKind === 'diff' ? (
-            <Box flexDirection="column" marginLeft={2}>
-              <DiffView patch={request.preview} columns={width} maxLines={20} indent={0} />
-            </Box>
-          ) : (
-            <Box flexDirection="column" marginLeft={2}>
-              {request.preview
-                .split('\n')
-                .slice(0, 12)
-                .map((line, index) => (
-                  <Text key={index} color={theme.colors.primary}>
-                    {truncateWidth(request.previewKind === 'command' ? `$ ${line}` : line, inner - 2)}
-                  </Text>
-                ))}
-            </Box>
-          )}
+          {hunks.map((hunk) => {
+            const selected = reviewing.accepted.has(hunk.index);
+            const onCursor = reviewing.cursor === hunk.index;
+            return (
+              <Box key={hunk.index} flexDirection="column" marginLeft={2}>
+                <Text
+                  color={onCursor ? theme.colors.primary : theme.colors.text}
+                  bold={onCursor}
+                >
+                  {`${onCursor ? theme.symbols.arrow : ' '} [${selected ? 'x' : ' '}] ${describeHunk(hunk)}`}
+                </Text>
+                {onCursor && (
+                  <Box flexDirection="column" marginLeft={4}>
+                    {hunk.lines.slice(0, 12).map((line, index) => (
+                      <Text
+                        key={index}
+                        color={
+                          line.type === 'add'
+                            ? theme.colors.success
+                            : line.type === 'remove'
+                              ? theme.colors.danger
+                              : theme.colors.muted
+                        }
+                        dimColor={line.type === 'context'}
+                      >
+                        {truncateWidth(
+                          `${line.type === 'add' ? '+' : line.type === 'remove' ? '-' : ' '}${line.text}`,
+                          inner - 6,
+                        )}
+                      </Text>
+                    ))}
+                    {hunk.lines.length > 12 && (
+                      <Text color={theme.colors.border}>{`  … ${hunk.lines.length - 12} more lines`}</Text>
+                    )}
+                  </Box>
+                )}
+              </Box>
+            );
+          })}
+          <Row theme={theme} width={inner} />
+          <Row theme={theme} width={inner}>
+            <Text color={theme.colors.border}>
+              {`space toggle · ↑↓ move · a all/none · enter apply ${reviewing.accepted.size} of ${hunks.length} · esc back`}
+            </Text>
+          </Row>
         </>
+      ) : (
+        request.preview &&
+        showPreview && (
+          <>
+            <Row theme={theme} width={inner} />
+            {request.previewKind === 'diff' ? (
+              <Box flexDirection="column" marginLeft={2}>
+                <DiffView patch={request.preview} columns={width} maxLines={20} indent={0} />
+              </Box>
+            ) : (
+              <Box flexDirection="column" marginLeft={2}>
+                {request.preview
+                  .split('\n')
+                  .slice(0, 12)
+                  .map((line, index) => (
+                    <Text key={index} color={theme.colors.primary}>
+                      {truncateWidth(request.previewKind === 'command' ? `$ ${line}` : line, inner - 2)}
+                    </Text>
+                  ))}
+              </Box>
+            )}
+          </>
+        )
       )}
 
       <Row theme={theme} width={inner} />
@@ -149,23 +258,20 @@ export function PermissionPrompt({
       {editing !== null ? (
         <>
           <Row theme={theme} width={inner}>
-            <Text color={theme.colors.muted}>What should Orbit do instead?</Text>
+            <Text color={theme.colors.muted}>{'What should Orbit do instead?'}</Text>
           </Row>
           <Row theme={theme} width={inner}>
-            <Text color={theme.colors.primary} bold>
-              {theme.symbols.prompt}{' '}
+            <Text color={theme.colors.text}>
+              {truncateWidth(editing || ' ', inner - 3)}
+              <Text color={theme.colors.primary}>{'_'}</Text>
             </Text>
-            <Text color={theme.colors.text}>{truncateWidth(editing, inner - 6)}</Text>
-            <Text inverse> </Text>
           </Row>
           <Row theme={theme} width={inner} />
           <Row theme={theme} width={inner}>
-            <Text color={theme.colors.border}>
-              enter to send · esc to go back
-            </Text>
+            <Text color={theme.colors.border}>enter to send · esc to go back</Text>
           </Row>
         </>
-      ) : (
+      ) : reviewing ? null : (
         <Row theme={theme} width={inner}>
           <Text>
             <Key theme={theme}>Y</Key>
@@ -182,6 +288,13 @@ export function PermissionPrompt({
             <Text color={theme.colors.text}> {request.destructive ? 'Cancel' : 'Deny'}   </Text>
             <Key theme={theme}>E</Key>
             <Text color={theme.colors.text}> Edit instruction</Text>
+            {hunks.length > 1 && (
+              <>
+                <Text color={theme.colors.muted}>{'   '}</Text>
+                <Key theme={theme}>P</Key>
+                <Text color={theme.colors.text}> Pick changes ({hunks.length})</Text>
+              </>
+            )}
             {request.preview && (
               <>
                 <Text color={theme.colors.muted}>{'   '}</Text>
@@ -233,10 +346,15 @@ function Key({
 export function PermissionRecord({
   request,
   choice,
+  accepted,
+  total,
   columns,
 }: {
   request: PermissionRequest;
   choice: PermissionChoice;
+  /** For a partial approval: how many of how many changes were kept. */
+  accepted?: number;
+  total?: number;
   columns: number;
 }): React.ReactElement {
   const theme = useTheme();
@@ -249,7 +367,9 @@ export function PermissionRecord({
           ? 'allowed for session'
           : choice === 'auto'
             ? 'auto-approved'
-            : 'allowed';
+            : choice === 'partial'
+              ? `applied ${accepted ?? 0} of ${total ?? 0} changes`
+              : 'allowed';
   const rejected = choice === 'deny' || choice === 'redirect';
   const color = rejected ? theme.colors.warning : theme.colors.success;
 

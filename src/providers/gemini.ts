@@ -190,10 +190,15 @@ export class GeminiProvider implements AIProvider {
         if (chunk.usageMetadata) {
           const prompt = Number(chunk.usageMetadata.promptTokenCount ?? 0);
           const completion = Number(chunk.usageMetadata.candidatesTokenCount ?? 0);
+          // Gemini bills thinking under its own counter rather than folding it
+          // into the candidate tokens, so it has to be added back to get the
+          // real completion cost.
+          const thoughts = Number(chunk.usageMetadata.thoughtsTokenCount ?? 0);
           usage = {
             promptTokens: prompt,
-            completionTokens: completion,
-            totalTokens: Number(chunk.usageMetadata.totalTokenCount ?? prompt + completion),
+            completionTokens: completion + thoughts,
+            totalTokens: Number(chunk.usageMetadata.totalTokenCount ?? prompt + completion + thoughts),
+            ...(thoughts > 0 ? { reasoningTokens: thoughts } : {}),
           };
         }
 

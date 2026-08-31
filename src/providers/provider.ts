@@ -71,6 +71,12 @@ export interface Usage {
   cachedTokens?: number;
   /** Prompt tokens written to the cache on this request. */
   cacheWriteTokens?: number;
+  /**
+   * Completion tokens the model spent thinking, where the provider separates
+   * them out. Already included in `completionTokens` — this says how much of it
+   * was reasoning rather than answer.
+   */
+  reasoningTokens?: number;
 }
 
 export type FinishReason = 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error' | 'cancelled';

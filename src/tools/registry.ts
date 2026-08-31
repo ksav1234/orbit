@@ -6,6 +6,7 @@ import type { PermissionCategory, PermissionManager, PermissionRequest } from '.
 import type { Sandbox } from '../permissions/sandbox.js';
 import type { ToolsConfig, WebConfig } from '../config/schema.js';
 import type { CheckpointManager } from '../checkpoints/manager.js';
+import type { ShellSession } from './shell-session.js';
 import type { FileReadTracker } from './tracker.js';
 import type { BackgroundRegistry } from './background.js';
 import type { WorkspaceInfo } from './project.js';
@@ -55,6 +56,8 @@ export interface ToolContext {
   visionAvailable: boolean;
   /** Snapshots files before they change, so a turn can be undone. */
   checkpoints?: CheckpointManager;
+  /** Carries `cd` and exported variables between shell commands. */
+  shellSession?: ShellSession;
   /** Tracks what the agent has read, to catch writes over external edits. */
   fileTracker?: FileReadTracker;
   /** Web access configuration and credentials, when the user enabled it. */
@@ -98,6 +101,20 @@ export interface ToolSpec<Schema extends z.ZodType> {
   readOnly: boolean;
   /** Build the approval prompt. Return null to execute without prompting. */
   authorize?(args: z.infer<Schema>, context: ToolContext): Promise<PermissionRequest | null>;
+  /**
+   * Rewrite the arguments to do only the part of the change the user accepted.
+   *
+   * Offered by tools whose approval prompt lists hunks. The tool owns this
+   * because only it knows how its arguments map onto the file — the loop must
+   * not be in the business of editing tool arguments it does not understand.
+   * Returning null means the selection could not be applied exactly, and the
+   * call is refused rather than half-done.
+   */
+  narrow?(
+    args: z.infer<Schema>,
+    selectedHunks: number[],
+    context: ToolContext,
+  ): Promise<z.infer<Schema> | null>;
   execute(args: z.infer<Schema>, context: ToolContext): Promise<ToolResult>;
 }
 
@@ -109,6 +126,8 @@ export interface Tool {
   readonly readOnly: boolean;
   parse(args: unknown): unknown;
   authorize(args: unknown, context: ToolContext): Promise<PermissionRequest | null>;
+  /** Present only on tools that can apply part of a proposed change. */
+  narrow?(args: unknown, selectedHunks: number[], context: ToolContext): Promise<unknown | null>;
   execute(args: unknown, context: ToolContext): Promise<ToolResult>;
 }
 
@@ -144,6 +163,12 @@ export function defineTool<Schema extends z.ZodType>(spec: ToolSpec<Schema>): To
       if (!spec.authorize) return null;
       return spec.authorize(args as z.infer<Schema>, context);
     },
+    ...(spec.narrow
+      ? {
+          narrow: async (args: unknown, selectedHunks: number[], context: ToolContext) =>
+            spec.narrow!(args as z.infer<Schema>, selectedHunks, context),
+        }
+      : {}),
     async execute(args, context) {
       return spec.execute(args as z.infer<Schema>, context);
     },

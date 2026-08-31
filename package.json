@@ -1,7 +1,7 @@
 {
   "name": "orbit-cli",
   "version": "0.1.0",
-  "description": "Orbit — AI that works inside your workspace.",
+  "description": "Orbit \u2014 AI that works inside your workspace.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -51,5 +51,8 @@
     "tsx": "^4.23.12",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"
+  },
+  "optionalDependencies": {
+    "@vscode/tree-sitter-wasm": "^0.3.1"
   }
 }

@@ -256,6 +256,88 @@ describe('Orbit app', () => {
     instance.unmount();
   });
 
+  it('reports what each model request cost, from provider-reported usage', async () => {
+    const { instance, output } = await mountApp([
+      { text: 'the answer', reasoningTokens: 18, cachedTokens: 40 },
+    ]);
+    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'));
+
+    instance.stdin.write('a question');
+    instance.stdin.write(ENTER);
+
+    await waitFor(() => output().includes('the answer'));
+    await waitFor(() => /up\s+\d/.test(output()));
+
+    const frame = output();
+    // Prompt and completion, plus how much of the window is now in use.
+    expect(frame).toMatch(/up\s+[\d.]+k?/);
+    expect(frame).toMatch(/down\s+[\d.]+k?/);
+    expect(frame).toContain('ctx');
+    // The thinking share and the cache hit, both provider-reported.
+    expect(frame).toContain('18 thinking');
+    expect(frame).toContain('40 cached');
+
+    instance.unmount();
+  });
+
+  it('applies only the hunks the user picked', async () => {
+    const original = [
+      'alpha',
+      'two',
+      'three',
+      'four',
+      'five',
+      'six',
+      'seven',
+      'eight',
+      'nine',
+      'ten',
+      'eleven',
+      'omega',
+    ].join('\n');
+    await writeFiles(workspace, { 'both.txt': original + '\n' });
+
+    // The model proposes two separate changes: one wanted, one not.
+    const proposed = original.replace('alpha', 'ALPHA').replace('omega', 'OMEGA');
+    const { instance, output } = await mountApp(
+      [
+        { toolCalls: [{ name: 'write_file', arguments: { path: 'both.txt', content: proposed + '\n' } }] },
+        { text: 'Applied what you kept.' },
+      ],
+      { write: 'ask' },
+    );
+
+    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'));
+    instance.stdin.write('change both ends');
+    instance.stdin.write(ENTER);
+
+    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('Permission required'));
+    // The prompt offers to pick, because there is more than one hunk.
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('Pick changes (2)');
+
+    await pressUntil(instance, 'p', () =>
+      stripAnsi(instance.lastFrame() ?? '').includes('space toggle'),
+    );
+
+    // Everything starts accepted; reject the second hunk and apply.
+    instance.stdin.write(DOWN);
+    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('apply 2 of 2'));
+    instance.stdin.write(' ');
+    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('apply 1 of 2'));
+    instance.stdin.write(ENTER);
+
+    await waitFor(() => output().includes('Applied what you kept.'));
+
+    const written = await fs.readFile(path.join(workspace, 'both.txt'), 'utf8');
+    // The kept change landed; the rejected one did not.
+    expect(written).toContain('ALPHA');
+    expect(written).toContain('omega');
+    expect(written).not.toContain('OMEGA');
+    expect(output()).toContain('applied 1 of 2 changes');
+
+    instance.unmount();
+  });
+
   it('handles slash commands without contacting the model', async () => {
     const { instance, output } = await mountApp([]);
     await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'));
@@ -533,8 +615,11 @@ describe('Orbit app', () => {
     await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('Permission required'));
     expect(stripAnsi(instance.lastFrame() ?? '')).toContain('[E] Edit instruction');
 
-    instance.stdin.write('e');
-    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What should Orbit do instead?'));
+    // Re-sent until the editor opens. Safe here because the assertions below are
+    // about the redirect reaching the model, not the exact text typed into it.
+    await pressUntil(instance, 'e', () =>
+      stripAnsi(instance.lastFrame() ?? '').includes('What should Orbit do instead?'),
+    );
     instance.stdin.write('use right.txt instead');
     instance.stdin.write(ENTER);
 
@@ -655,8 +740,9 @@ describe('Orbit app', () => {
     instance.stdin.write(ENTER);
     await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('Model  Mock'));
 
-    instance.stdin.write(ESCAPE); // esc
-    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'));
+    await pressUntil(instance, ESCAPE, () =>
+      stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'),
+    );
 
     expect(agent.model).toBe('mock-model');
     instance.unmount();
@@ -687,8 +773,9 @@ describe('Orbit app', () => {
     expect(frame).toContain('Mock');
     expect(frame).toContain('key set');
 
-    instance.stdin.write(ESCAPE);
-    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'));
+    await pressUntil(instance, ESCAPE, () =>
+      stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'),
+    );
     instance.unmount();
   });
 
@@ -736,8 +823,9 @@ describe('Orbit app', () => {
     await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('ORBIT') ||
       stripAnsi(instance.lastFrame() ?? '').includes('█'));
 
-    instance.stdin.write(' ');
-    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'));
+    await pressUntil(instance, ' ', () =>
+      stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'),
+    );
 
     instance.unmount();
   });
