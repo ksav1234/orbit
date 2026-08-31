@@ -239,6 +239,21 @@ export const OptimizerConfigSchema = z.object({
    * generated. Turn this off to keep startup to zero extra requests.
    */
   probeWindow: z.boolean().default(true),
+  /**
+   * Extra output budget granted to a model that thinks.
+   *
+   * Reasoning is billed as completion tokens, so thinking and the answer draw
+   * on the same `max_tokens`. Without headroom a long think consumes the whole
+   * budget and the answer is truncated to nothing.
+   */
+  reasoningHeadroom: z.number().int().min(0).max(200_000).default(8_192),
+  /**
+   * Retry a request that hit the output limit with a bigger budget, instead of
+   * handing back a truncated turn and waiting to be told to continue.
+   */
+  retryOnOutputLimit: z.boolean().default(true),
+  /** How many times to widen and retry within one request. */
+  maxOutputLimitRetries: z.number().int().min(0).max(4).default(2),
 });
 export type OptimizerConfig = z.infer<typeof OptimizerConfigSchema>;
 

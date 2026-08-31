@@ -22,6 +22,12 @@ export interface TurnUsage {
   reasoningTokens?: number;
   /** Response budget the optimizer granted for this request. */
   budgetTokens?: number;
+  /**
+   * The provider stopped because the output budget ran out, not because the
+   * model was finished. Recorded because such a completion is not evidence of
+   * how long a reply *wants* to be — it is evidence of the cap.
+   */
+  truncated?: boolean;
   durationMs?: number;
 }
 
@@ -194,6 +200,31 @@ export class UsageTracker {
   peakCompletion(samples = 8): number {
     const recent = this.turns.slice(-samples);
     return recent.reduce((peak, turn) => Math.max(peak, turn.completionTokens), 0);
+  }
+
+  /**
+   * How much of a recent reply went on thinking.
+   *
+   * The budget has to cover thinking *and* the answer, so this is what tells
+   * the optimizer how much of a grant a reasoning model will spend before it
+   * writes anything at all.
+   */
+  peakReasoning(samples = 8): number {
+    const recent = this.turns.slice(-samples);
+    return recent.reduce((peak, turn) => Math.max(peak, turn.reasoningTokens ?? 0), 0);
+  }
+
+  averageReasoning(samples = 8): number {
+    const recent = this.turns.slice(-samples).filter((turn) => (turn.reasoningTokens ?? 0) > 0);
+    if (recent.length === 0) return 0;
+    return Math.round(
+      recent.reduce((sum, turn) => sum + (turn.reasoningTokens ?? 0), 0) / recent.length,
+    );
+  }
+
+  /** True when the most recent request was cut off by its output budget. */
+  lastWasTruncated(): boolean {
+    return this.turns[this.turns.length - 1]?.truncated === true;
   }
 
   async save(): Promise<void> {

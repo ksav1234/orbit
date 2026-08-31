@@ -311,6 +311,35 @@ replaces it when the request completes. Turn the whole line off with
 
 `/usage` totals it per session and lifetime, including the thinking share.
 
+### Thinking shares the output budget
+
+Reasoning is billed as completion tokens, so thinking and the answer draw on the
+same `max_tokens`. That creates a trap worth knowing about: a model granted 1.4k
+can spend all 1.4k reasoning and write nothing, and the turn ends looking like a
+refusal.
+
+Three things prevent it:
+
+- **The budget is sized for thinking plus answer.** Observed reasoning sets a
+  floor of roughly twice what the model actually thinks, and
+  `optimizer.reasoningHeadroom` (8k default) is added on top. A model that does
+  not reason gets none of this padding.
+- **A truncated reply is not treated as evidence of reply length.** It is
+  evidence of the cap, so the next grant doubles instead of creeping up 35% at a
+  time and truncating forever.
+- **A request that produced only thinking is retried, wider.** Up to
+  `optimizer.maxOutputLimitRetries` times (2 by default), rather than handing
+  back an empty turn for you to prod with "continue":
+
+```
+Output limit reached at 1.4k tokens with nothing but thinking to show.
+Retrying with 5.5k.
+```
+
+A reply that was cut off mid-sentence is **kept**, not retried — it has content
+worth having, and re-asking would discard work you already paid for. Only a reply
+with nothing usable in it is worth asking again.
+
 ### Real prices, where the provider publishes them
 
 Orbit still ships no rate table — prices change, and a stale number is worse

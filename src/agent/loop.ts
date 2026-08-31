@@ -14,6 +14,7 @@ import type {
 import type { Tool, ToolContext, ToolRegistry, ToolResult } from '../tools/registry.js';
 import { toolError } from '../tools/registry.js';
 import { OrbitError, errorMessage, isCancellation, toFriendlyError } from '../util/errors.js';
+import { formatCount } from '../util/format.js';
 import { mapConcurrent, retry, withTimeout } from '../util/async.js';
 import { createLogger } from '../util/logger.js';
 import { parseToolProtocol } from './protocol.js';
@@ -83,7 +84,16 @@ export interface AgentLoopDeps {
   /** Adaptive token budgeting. Omit to use the configured limits as-is. */
   optimizer?: TokenOptimizer;
   /** Recent completion sizes, used to right-size the response budget. */
-  usageStats?: { averageCompletion(): number; peakCompletion(): number; requests(): number };
+  usageStats?: {
+    averageCompletion(): number;
+    peakCompletion(): number;
+    /** Thinking sizes, which share the output budget with the answer. */
+    averageReasoning?(): number;
+    peakReasoning?(): number;
+    /** Whether the last request was cut off by its own budget. */
+    lastWasTruncated?(): boolean;
+    requests(): number;
+  };
   /** Builds a fresh ToolContext for each call (carries the abort signal). */
   createToolContext(
     signal: AbortSignal,
@@ -119,6 +129,14 @@ export class AgentLoop {
   private readonly usage: Usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   /** Who is answering right now. Changes only through failover. */
   private active: { provider: AIProvider; model: string; label: string };
+  /** Retries spent widening the output budget within this turn. */
+  private outputLimitRetries = 0;
+  /**
+   * A budget the optimizer must not shrink below, set after a truncation. The
+   * optimizer sizes from observation; this is the one case where the loop knows
+   * better than the observation does.
+   */
+  private forcedBudget: number | undefined;
   /** Response budget granted for the request currently in flight. */
   private responseBudget: number;
 
@@ -177,6 +195,7 @@ export class AgentLoop {
               cachedTokens: response.usage.cachedTokens,
               reasoningTokens: response.usage.reasoningTokens,
               budgetTokens: this.responseBudget,
+              truncated: response.finishReason === 'length',
               durationMs: Date.now() - startedAt,
             },
           });
@@ -186,6 +205,21 @@ export class AgentLoop {
         const { text, calls, protocolErrors } = this.extractToolCalls(response);
 
         if (calls.length === 0) {
+          // Checked before the message is recorded: a think that consumed the
+          // whole grant produced nothing worth keeping, and asking again with a
+          // bigger budget beats handing back an empty turn for the user to prod
+          // with "continue".
+          if (response.finishReason === 'length' && this.shouldWidenAndRetry(text)) {
+            const previous = this.responseBudget;
+            this.outputLimitRetries += 1;
+            this.forcedBudget = Math.max(previous * 2, previous + 4_096);
+            emit({
+              type: 'notice',
+              message: `Output limit reached at ${formatCount(previous)} tokens with nothing but thinking to show. Retrying with ${formatCount(this.forcedBudget)}.`,
+            });
+            continue;
+          }
+
           this.deps.context.addAssistantMessage(text, []);
           emit({ type: 'assistant-message', text, reasoning: response.reasoning });
 
@@ -255,7 +289,7 @@ export class AgentLoop {
   private optimize(): OptimizationDecision | null {
     const { optimizer, usageStats, context, registry, config, emit } = this.deps;
     if (!optimizer) {
-      this.responseBudget = config.maxTokens;
+      this.responseBudget = this.forcedBudget ?? config.maxTokens;
       return null;
     }
 
@@ -268,12 +302,37 @@ export class AgentLoop {
       configuredMaxTokens: config.maxTokens,
       averageCompletion: usageStats?.averageCompletion() ?? 0,
       peakCompletion: usageStats?.peakCompletion() ?? 0,
+      averageReasoning: usageStats?.averageReasoning?.() ?? 0,
+      peakReasoning: usageStats?.peakReasoning?.() ?? 0,
+      lastTruncated: usageStats?.lastWasTruncated?.() ?? false,
       samples: usageStats?.requests() ?? 0,
     });
 
-    this.responseBudget = decision.responseTokens;
+    this.responseBudget = this.forcedBudget
+      ? Math.max(decision.responseTokens, Math.min(this.forcedBudget, budget.available))
+      : decision.responseTokens;
     if (decision.changed) emit({ type: 'optimization', decision });
     return decision;
+  }
+
+  /**
+   * Whether hitting the output limit is worth another, larger attempt.
+   *
+   * Only when the model produced nothing usable — a reply that was cut off
+   * mid-sentence still has content worth keeping, and re-asking would throw
+   * away work and bill for it twice. A think that ate the whole budget produced
+   * no answer at all, which is the case worth retrying.
+   */
+  private shouldWidenAndRetry(text: string): boolean {
+    const config = this.deps.optimizer?.getConfig();
+    if (!config?.retryOnOutputLimit) return false;
+    if (this.outputLimitRetries >= config.maxOutputLimitRetries) return false;
+    if (text.trim().length > 0) return false;
+
+    // Room to actually grant more, or there is no point asking again.
+    const tools = this.nativeToolsAvailable() ? this.deps.registry.definitions() : [];
+    const budget = this.deps.context.budget(tools);
+    return budget.available > this.responseBudget + 1_024;
   }
 
   private async maybeCompact(signal: AbortSignal, force = false): Promise<void> {

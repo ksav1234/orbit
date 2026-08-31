@@ -16,6 +16,19 @@ export interface OptimizationInput {
   /** Observed completion sizes, used to right-size the budget. */
   averageCompletion: number;
   peakCompletion: number;
+  /**
+   * Observed thinking sizes. Reasoning is billed inside the completion, so a
+   * model that thinks for 1.4k tokens needs that much budget *before* it writes
+   * a word — sizing from the answer alone starves it.
+   */
+  averageReasoning?: number;
+  peakReasoning?: number;
+  /**
+   * The last request was cut off by its own budget. Without this the optimizer
+   * reads a truncated completion as a normal-sized reply and keeps granting the
+   * same too-small figure, truncating every turn.
+   */
+  lastTruncated?: boolean;
   /** Number of requests observed so far, to know how much to trust the stats. */
   samples: number;
 }
@@ -123,19 +136,34 @@ export class TokenOptimizer {
         ? Math.max(input.peakCompletion * 1.35, input.averageCompletion * 2)
         : input.configuredMaxTokens;
 
-    const wanted = clamp(
-      Math.ceil(observed || input.configuredMaxTokens),
-      this.config.minResponseTokens,
-      ceiling,
-    );
+    // A model that thinks spends part of every grant before it writes anything,
+    // so the floor has to clear its thinking plus room for a real answer.
+    const reasoning = Math.max(input.peakReasoning ?? 0, input.averageReasoning ?? 0);
+    const thinks = reasoning > 0;
+    const headroom = thinks
+      ? Math.min(this.config.reasoningHeadroom, Math.max(0, Math.floor(available / 2)))
+      : 0;
+    const floor = thinks
+      ? Math.max(this.config.minResponseTokens, reasoning * 2 + this.config.minResponseTokens)
+      : this.config.minResponseTokens;
+
+    let wanted = clamp(Math.ceil(observed || input.configuredMaxTokens) + headroom, floor, ceiling);
+
+    // The escape from the feedback trap: a truncated reply is evidence the
+    // budget was too small, not evidence of how long replies are. Double it
+    // rather than crawling up 35% at a time while every turn gets cut off.
+    if (input.lastTruncated) {
+      const previous = this.previous?.responseTokens ?? wanted;
+      wanted = clamp(Math.max(wanted, previous * 2), floor, ceiling);
+    }
 
     const responseTokens = Math.max(
       Math.min(wanted, available),
-      Math.min(this.config.minResponseTokens, available),
+      Math.min(floor, available),
     );
 
     // If even the floor does not fit, the conversation has to shrink first.
-    const compactFirst = available < this.config.minResponseTokens;
+    const compactFirst = available < floor;
 
     const scale = toolOutputScale(pressure, this.config.adaptiveToolOutput);
     const windowScale = this.windowScale(window);

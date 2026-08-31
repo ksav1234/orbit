@@ -546,6 +546,9 @@ export class Agent {
         usageStats: {
           averageCompletion: () => this.usageTracker.averageCompletion(),
           peakCompletion: () => this.usageTracker.peakCompletion(),
+          averageReasoning: () => this.usageTracker.averageReasoning(),
+          peakReasoning: () => this.usageTracker.peakReasoning(),
+          lastWasTruncated: () => this.usageTracker.lastWasTruncated(),
           requests: () => this.usageTracker.sessionTotals().requests,
         },
         createToolContext: (signal, progress, limits) =>
