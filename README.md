@@ -916,6 +916,30 @@ passing.
 > If you hit a POSIX-specific problem, it is a genuine gap rather than something
 > that was checked and dismissed.
 
+### A note on NODE_ENV
+
+Orbit defaults `NODE_ENV` to `production` for its own process when you have not
+set it. React chooses between its two builds by reading that variable **at import
+time**, and the development build calls `performance.measure()` on every render —
+a few hundred entries a second for a live terminal UI. Nothing drains Node's
+global user-timing buffer, so an hour-long session used to end in:
+
+```
+MaxPerformanceEntryBufferExceededWarning: Possible perf_hooks memory leak
+detected. 1000001 measure entries added to the global performance entry buffer.
+```
+
+The development build is slower besides. Two things follow:
+
+- **Child processes never see the injected value.** Orbit runs your tests, your
+  builds and your hooks, and they get the environment you have — not one Orbit
+  invented for its own renderer. A `NODE_ENV` you set yourself is passed straight
+  through and never overridden.
+- **If your shell exports `NODE_ENV=development`**, Orbit honours it and React
+  loads the development build regardless. A performance observer then clears the
+  entries as they arrive, which keeps the buffer at a handful instead of a
+  million.
+
 ## Known limitations
 
 - OCR for scanned PDFs is not bundled. Orbit reports when a PDF has no text layer

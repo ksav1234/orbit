@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { childEnv } from '../util/env.js';
 import { OrbitError } from '../util/errors.js';
 import { prepareSpawn } from '../util/process.js';
 import { createLogger } from '../util/logger.js';
@@ -95,7 +96,7 @@ export class McpClient {
     try {
       this.child = spawn(prepared.command, prepared.args, {
         cwd: this.config.cwd,
-        env: { ...process.env, ...this.config.env },
+        env: { ...childEnv(), ...this.config.env },
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
         windowsVerbatimArguments: prepared.verbatim,

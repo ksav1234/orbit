@@ -1,6 +1,7 @@
 import { spawn, type SpawnOptions } from 'node:child_process';
 import { statSync } from 'node:fs';
 import path from 'node:path';
+import { childEnv } from './env.js';
 import { CancelledError } from './errors.js';
 import { createLogger } from './logger.js';
 
@@ -143,7 +144,7 @@ export function runCommand(options: RunOptions): Promise<RunResult> {
 
     const spawnOptions: SpawnOptions = {
       cwd,
-      env: env ?? process.env,
+      env: childEnv(env),
       shell,
       windowsHide: true,
       windowsVerbatimArguments: prepared.verbatim,

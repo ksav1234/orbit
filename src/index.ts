@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// Must stay the first import. React picks its build by reading NODE_ENV at
+// import time, so this has to run before `ink` and `react` are evaluated.
+import { drainPerformanceEntries } from './util/env.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -1604,6 +1607,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     const file = enableDebugLogging();
     print(ui.dim(`Debug log: ${tildify(file)}`));
   }
+
+  // Only matters when the user's own NODE_ENV forces React's development build,
+  // which emits a performance entry per render that nothing else drains.
+  drainPerformanceEntries();
 
   await ensureOrbitHome();
 
