@@ -697,6 +697,38 @@ authoritative.
 
 Set `TAVILY_API_KEY` and Orbit will use that instead of the stored key.
 
+## Finishing what you asked for
+
+The first thing in Orbit's system prompt, ahead of everything except its
+identity, is that resolving your request is the highest priority in the session.
+Concretely, the model is told:
+
+- The task is done when your goal is met, not when it has made some progress.
+- One route failing is not the task failing — try another way before concluding
+  it cannot be done.
+- Never hand back partial work as if it were finished. Say which part is
+  outstanding and why.
+- If genuinely blocked, say precisely what is blocking it and what it needs.
+  Do not go quiet, and do not substitute an easier task.
+
+Working inside your guardrails is part of that, not a conflict with it. The
+workspace boundary, the permission prompts and the approval settings are *your*
+instructions too — honouring them is honouring the request. If one genuinely
+stands between Orbit and the goal, it says so and asks rather than working
+around it quietly.
+
+A prompt alone is only words, so stopping short is also made visible. Orbit used
+to hit its step limit and simply stop, which made a half-done task look
+finished. Now it says so:
+
+```
+⚠ Stopped after 40 steps without finishing — the task is not done.
+  Say "continue" to carry on, or raise agent.maxIterations.
+```
+
+Headless runs say the same on stderr and exit non-zero, so a script can tell a
+finished job from one that ran out of steps.
+
 ## Checking its own work
 
 Orbit can run your project's real checks after a turn that changed files, hand

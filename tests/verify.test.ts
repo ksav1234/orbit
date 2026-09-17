@@ -502,3 +502,57 @@ describe('the agent checking its own work', () => {
     ).toBe(true);
   });
 });
+
+// ── Not going quiet ───────────────────────────────────────────────────────
+
+describe('running out of steps', () => {
+  // Hitting the iteration limit used to end the turn with no word of it, so a
+  // half-done task looked finished. Stopping short has to be visible.
+  it('reports the reason so a caller can tell it did not finish', async () => {
+    // A model that only ever calls tools never reaches a final answer.
+    const turns = Array.from({ length: 10 }, (_, i) => ({
+      toolCalls: [{ name: 'write_file', arguments: { path: `f${i}.txt`, content: String(i) } }],
+    }));
+    server = await startMockProvider(turns);
+
+    const config = ConfigSchema.parse({
+      permissions: { write: 'allow' },
+      optimizer: { enabled: false, autoDetectWindow: false },
+      agent: { maxIterations: 3 },
+    });
+    const agent = new Agent({
+      provider: createProvider({
+        config: {
+          id: 'mock',
+          label: 'Mock',
+          kind: 'openai-compatible',
+          baseURL: server.baseURL,
+          model: 'mock-model',
+          models: ['mock-model'],
+          headers: {},
+          supportsTools: true,
+          supportsVision: false,
+        },
+        apiKey: 'sk-mock-key-1234567890',
+        model: 'mock-model',
+      }),
+      model: 'mock-model',
+      config,
+      sandbox: new Sandbox({ root: workspace }),
+      permissions: new PermissionManager({ policy: config.permissions }),
+      registry: buildToolRegistry({}),
+      planner: new Planner(),
+      workspace: await detectWorkspace(workspace),
+      sessions: new SessionManager(),
+      providerLabel: 'Mock',
+    });
+    await agent.initialize();
+
+    const result = await agent.send('keep going forever');
+
+    // The reason is on the result, not buried — the UI and headless output both
+    // key off it to say the task is incomplete.
+    expect(result.reason).toBe('max-iterations');
+    expect(result.iterations).toBe(3);
+  });
+});

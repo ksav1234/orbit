@@ -408,6 +408,14 @@ export function App(props: AppProps): React.ReactElement {
           setStreamText('');
           setReasoning('');
           setUsedTokens(agent.context.budget(registry.definitions()).used);
+          // Hitting the iteration limit is not finishing. Saying nothing makes a
+          // half-done task look complete, which is the worst way to stop.
+          if (event.reason === 'max-iterations') {
+            notice(
+              `Stopped after ${event.iterations} steps without finishing — the task is not done. Say "continue" to carry on, or raise agent.maxIterations.`,
+              'warning',
+            );
+          }
           if (event.reason === 'cancelled') {
             // A cancellation is the user taking back control: stop auto-working.
             pendingContinuation.current = null;

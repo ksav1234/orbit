@@ -171,6 +171,13 @@ export async function runHeadless(options: HeadlessOptions): Promise<HeadlessRes
         parts.push(turnReason);
         printError(ui.dim(`\n${parts.join(' · ')}`));
       }
+      // Always said, verbose or not: a scripted caller has to be able to tell
+      // a finished job from one that ran out of steps.
+      if (turnReason === 'max-iterations') {
+        printError(
+          ui.warn('Stopped at the step limit without finishing. The task is incomplete.'),
+        );
+      }
     }
     for (const entry of denied) {
       printError(ui.warn(`denied: ${entry}`));

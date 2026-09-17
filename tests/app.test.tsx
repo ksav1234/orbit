@@ -338,6 +338,27 @@ describe('Orbit app', () => {
     instance.unmount();
   });
 
+  it('says plainly when it stopped without finishing', async () => {
+    // A model that only ever calls tools never reaches a final answer, so the
+    // turn ends at the step limit rather than at an answer.
+    const turns = Array.from({ length: 10 }, (_, i) => ({
+      toolCalls: [
+        { name: 'write_file', arguments: { path: `f${i}.txt`, content: String(i) } },
+      ],
+    }));
+    const { instance, output } = await mountApp(turns, { write: 'allow' }, {}, {});
+
+    await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'));
+    instance.stdin.write('do a long job');
+    instance.stdin.write(ENTER);
+
+    // Silence here would make a half-done task look finished.
+    await waitFor(() => /without finishing|not done/i.test(output()));
+    expect(output()).toMatch(/continue/i);
+
+    instance.unmount();
+  });
+
   it('handles slash commands without contacting the model', async () => {
     const { instance, output } = await mountApp([]);
     await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'));
