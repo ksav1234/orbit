@@ -37,6 +37,8 @@ import {
   type NoticeTone,
 } from '../ui/components/Message.js';
 import { estimateTokens } from '../context/tokenizer.js';
+import { clipToRows } from '../util/format.js';
+import { useInputRecorder } from '../ui/input-buffer.js';
 import { ToolCallView } from '../ui/components/ToolCall.js';
 import { PermissionPrompt, PermissionRecord } from '../ui/components/Permission.js';
 import { SelectPrompt, SecretPrompt, type SelectOption } from '../ui/components/Select.js';
@@ -157,7 +159,7 @@ const nextId = (prefix: string): string => `${prefix}-${++sequence}`;
 export function App(props: AppProps): React.ReactElement {
   const { agent, theme, registry, sandbox, config, sessions, permissions, autoMode, debug } = props;
   const { exit } = useApp();
-  const { columns, layout } = useTerminalSize();
+  const { columns, rows, layout } = useTerminalSize();
 
   const animating = Boolean(props.animate && props.showBanner);
   const [transcript, setTranscript] = useState<TranscriptItem[]>(() =>
@@ -450,6 +452,17 @@ export function App(props: AppProps): React.ReactElement {
           // "Edit instruction" rejects the operation and tells the model what
           // the user wants instead, so the turn continues rather than stalling.
           permissions.setRedirect(choice === 'redirect' ? (instruction ?? null) : null);
+          // Rejecting an operation *and saying what you wanted instead* is the
+          // most valuable sentence in a session: it is a rule, not a request.
+          // Keep it, so the same correction is not needed again next week.
+          if (choice === 'redirect' && instruction?.trim()) {
+            void agent
+              .rememberLesson(instruction, 'correction', request.title)
+              .then((kept) => {
+                if (kept) notice(`Remembered for next time: ${instruction.trim()}`);
+              })
+              .catch(() => {});
+          }
           // "Pick changes" approves a subset; the tool narrows itself to it.
           permissions.setHunkSelection(choice === 'partial' ? (hunks ?? []) : null);
           append({
@@ -899,6 +912,11 @@ export function App(props: AppProps): React.ReactElement {
     void runPrompt(props.initialPrompt);
   }, [props.initialPrompt, runPrompt]);
 
+  // Watches stdin for the whole session so that keystrokes typed in the instant
+  // a prompt appears — after the frame is drawn, before its handler subscribes —
+  // are held rather than lost.
+  useInputRecorder(true);
+
   const keyState = useGlobalKeys({
     busy,
     active: !pendingPermission && !modal && !introPlaying,
@@ -976,6 +994,21 @@ export function App(props: AppProps): React.ReactElement {
     ].filter(Boolean);
     return parts.join(' · ');
   }, [agent]);
+
+  /**
+   * The streaming reply, clipped to what the window can update in place.
+   *
+   * Ink repaints its live region by rewriting the lines it occupies; once that
+   * region is taller than the terminal it clears the whole screen instead, and
+   * the redraw shows up as flicker. Reserving room for the input, footer and any
+   * running tools keeps the region inside the window, and the full text still
+   * reaches scrollback when the turn ends.
+   */
+  const liveStream = useMemo(() => {
+    const reserved = 8 + activeTools.length * 3 + (reasoning && status === 'thinking' ? 4 : 0);
+    const available = Math.max(6, rows - reserved);
+    return clipToRows(streamText, available, columns);
+  }, [streamText, rows, columns, activeTools.length, reasoning, status]);
 
   const statusLabel =
     status === 'thinking'
@@ -1059,7 +1092,14 @@ export function App(props: AppProps): React.ReactElement {
           <ReasoningTrace text={reasoning} columns={columns} tokens={estimateTokens(reasoning)} />
         )}
 
-        {streamText && <AssistantMessage text={streamText} columns={columns} streaming />}
+        {streamText && (
+          <AssistantMessage
+            text={liveStream.text}
+            columns={columns}
+            streaming
+            hiddenLines={liveStream.hiddenLines}
+          />
+        )}
 
         {activeTools.map((tool) => (
           <ToolCallView

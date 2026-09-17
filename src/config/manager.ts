@@ -122,6 +122,18 @@ function salvageCollection(
   return undefined;
 }
 
+/** Which keys each top-level section actually declared in the file. */
+function recordWrittenKeys(json: unknown): Record<string, Set<string>> {
+  const written: Record<string, Set<string>> = {};
+  if (!json || typeof json !== 'object') return written;
+  for (const [section, value] of Object.entries(json as Record<string, unknown>)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      written[section] = new Set(Object.keys(value));
+    }
+  }
+  return written;
+}
+
 export class ConfigManager {
   private config: OrbitConfig = defaultConfig();
   private credentials: CredentialStore = {};
@@ -129,6 +141,8 @@ export class ConfigManager {
   private issues: ConfigIssue[] = [];
   /** Whether the damaged original has already been copied aside. */
   private backedUp = false;
+  /** Per-section, the keys that were literally present in the file. */
+  private written: Record<string, Set<string>> = {};
 
   async load(): Promise<OrbitConfig> {
     await ensureOrbitHome();
@@ -160,6 +174,8 @@ export class ConfigManager {
         hints: [`Fix or delete ${orbitPaths.config}`],
       });
     }
+
+    this.written = recordWrittenKeys(json);
 
     const parsed = ConfigSchema.safeParse(json);
     if (parsed.success) return parsed.data;
@@ -199,6 +215,16 @@ export class ConfigManager {
   }
 
   /** Apply a partial update, validate the result, and persist it. */
+  /**
+   * Keys the user wrote in a section, as opposed to schema defaults.
+   *
+   * Orbit tightens a few settings when it is editing its own source, and needs
+   * to know the difference between "they chose false" and "they never said".
+   */
+  explicitKeys(section: string): ReadonlySet<string> {
+    return this.written[section] ?? new Set<string>();
+  }
+
   /** Sections that failed validation at load and were reset. Empty when clean. */
   validationIssues(): ConfigIssue[] {
     return this.issues;
@@ -239,6 +265,26 @@ export class ConfigManager {
     await this.backupIfSalvaged();
     await this.save();
     return this.config;
+  }
+
+  /**
+   * Record that the user chose these settings deliberately.
+   *
+   * Diffing the config cannot tell: setting a value that happens to equal the
+   * schema default produces no change, and that is exactly the case that
+   * matters — `orbit verify off` writes `false`, which is also the default, yet
+   * it is unmistakably a choice. So the caller says so.
+   *
+   * Paths are `section.key`, matching how they read in the config file.
+   */
+  markExplicit(...paths: string[]): void {
+    for (const path of paths) {
+      const [section, key] = path.split('.');
+      if (!section || !key) continue;
+      const keys = this.written[section] ?? new Set<string>();
+      keys.add(key);
+      this.written[section] = keys;
+    }
   }
 
   async save(): Promise<void> {

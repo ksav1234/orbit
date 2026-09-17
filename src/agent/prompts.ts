@@ -20,6 +20,8 @@ export interface PromptContext {
   visionAvailable: boolean;
   /** True when tool calls must be emitted as text using the fallback protocol. */
   fallbackToolProtocol: boolean;
+  /** Rendered lessons from earlier sessions in this workspace. */
+  lessons?: string;
   /** Project instruction file contents (ORBIT.md / AGENTS.md), if present. */
   projectInstructions?: string;
 }
@@ -88,6 +90,10 @@ export function buildSystemPrompt(context: PromptContext): string {
       `Vision\n\nThe selected model (${context.model}) cannot accept images. If the user asks about an image, say so plainly and offer to switch models. Never describe an image you were not shown.`,
     );
   }
+
+  // What earlier sessions in this workspace established, so the same correction
+  // is not needed every week.
+  if (context.lessons) sections.push(context.lessons);
 
   if (context.fallbackToolProtocol) sections.push(FALLBACK_PROTOCOL_INSTRUCTIONS(context.toolNames));
 

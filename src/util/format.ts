@@ -95,3 +95,48 @@ export function padEndWidth(text: string, width: number): string {
   const w = stringWidth(text);
   return w >= width ? text : text + ' '.repeat(width - w);
 }
+
+/**
+ * Keep a growing block of text short enough that the terminal can update it in
+ * place.
+ *
+ * Ink repaints its live region by moving the cursor up and rewriting those
+ * lines. That only works while the region is shorter than the window: once it
+ * is taller, Ink falls back to clearing the whole screen on every update, and
+ * the redraw is visible as flicker. Measured on a 30-row terminal, a 10- or
+ * 29-line region produced zero full-screen clears; an 80-line region produced
+ * one on nearly every repaint.
+ *
+ * So a streaming reply shows its tail — the part being written — with a count
+ * of what scrolled past. The full text is never lost: it is committed to
+ * scrollback when the turn ends.
+ */
+export function clipToRows(
+  text: string,
+  maxRows: number,
+  columns: number,
+): { text: string; hiddenLines: number } {
+  if (maxRows <= 0) return { text: '', hiddenLines: 0 };
+
+  const width = Math.max(1, columns);
+  const lines = text.split('\n');
+
+  // A long line wraps, so it costs more than one row of the window.
+  const rowsFor = (line: string): number => Math.max(1, Math.ceil(stringWidth(line) / width));
+
+  let used = 0;
+  let start = lines.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const cost = rowsFor(lines[i] ?? '');
+    if (used + cost > maxRows) break;
+    used += cost;
+    start = i;
+  }
+
+  // Always show something, even if a single line is wider than the whole window.
+  if (start >= lines.length) {
+    return { text: lines[lines.length - 1] ?? '', hiddenLines: Math.max(0, lines.length - 1) };
+  }
+
+  return { text: lines.slice(start).join('\n'), hiddenLines: start };
+}

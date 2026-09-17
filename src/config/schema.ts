@@ -56,6 +56,26 @@ export const AgentConfigSchema = z.object({
   parallelReadTools: z.boolean().default(true),
   requestTimeoutMs: z.number().int().positive().default(180_000),
   maxRetries: z.number().int().min(0).max(10).default(3),
+  /**
+   * Budget for carrying your earlier instructions through compaction
+   * word-for-word.
+   *
+   * A summary records what happened, not what it was told. Without this, a
+   * standing instruction given once at the start of a long session is
+   * paraphrased into nothing and the agent appears to forget it. Set to 0 to
+   * summarise everything instead.
+   */
+  keepInstructionTokens: z.number().int().min(0).max(32_000).default(1_500),
+  /**
+   * Remember corrections between sessions, per workspace.
+   *
+   * When you reject an operation and say what you wanted instead, that sentence
+   * is a rule rather than a request. Stored under `~/.orbit`, never written
+   * into your project.
+   */
+  rememberLessons: z.boolean().default(true),
+  /** Prompt budget for those remembered lessons. */
+  lessonTokens: z.number().int().min(0).max(8_000).default(600),
 });
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
 
@@ -353,6 +373,33 @@ export const FailoverConfigSchema = z.object({
 });
 export type FailoverConfig = z.infer<typeof FailoverConfigSchema>;
 
+/**
+ * Checking the agent's own work, and fixing what it broke.
+ *
+ * After a turn that changed files, Orbit runs the project's real checks, hands
+ * any failure back to the model as evidence, and lets it try again. Off by
+ * default because it runs commands on your machine and spends tokens doing it —
+ * `orbit verify on` is the whole setup.
+ */
+export const VerifyConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  /** Commands to run. Empty means detect them from the project. */
+  commands: z.array(z.string()).default([]),
+  /** Attempts at fixing a failure before handing back to you. */
+  maxRounds: z.number().int().min(1).max(5).default(2),
+  timeoutMs: z.number().int().positive().default(300_000),
+  /** Skip verification entirely when the turn touched no files. */
+  onlyOnChange: z.boolean().default(true),
+  /**
+   * Undo the turn when the checks still fail after the last attempt.
+   *
+   * Leaves the workspace as it was rather than half-fixed. Off by default: a
+   * partly-working change is often still worth having and looking at.
+   */
+  rollbackOnFailure: z.boolean().default(false),
+});
+export type VerifyConfig = z.infer<typeof VerifyConfigSchema>;
+
 export const ConfigSchema = z.object({
   version: z.literal(1).default(1),
   activeProvider: z.string().optional(),
@@ -368,6 +415,7 @@ export const ConfigSchema = z.object({
   pricing: PricingConfigSchema.default({}),
   tools: ToolsConfigSchema.default({}),
   failover: FailoverConfigSchema.default({}),
+  verify: VerifyConfigSchema.default({}),
   hooks: HooksConfigSchema.default({}),
   ui: UiConfigSchema.default({}),
   sessions: SessionsConfigSchema.default({}),

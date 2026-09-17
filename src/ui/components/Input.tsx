@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useReducer, useRef } from 'react';
-import { Box, Text, useInput } from 'ink';
+import { Box, Text } from 'ink';
+import { useBufferedInput } from '../input-buffer.js';
 import { useTheme } from '../context.js';
 import type { Completion, CompletionResult, InputHistory } from '../../cli/input.js';
 import { commonPrefix } from '../../cli/input.js';
@@ -105,7 +106,7 @@ export function PromptInput({
     if (disabled) clearSuggestions();
   }, [disabled, clearSuggestions]);
 
-  useInput(
+  useBufferedInput(
     (input, key) => {
       if (disabled) return;
 

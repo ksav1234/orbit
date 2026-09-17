@@ -1,5 +1,6 @@
 import React, { useReducer, useRef, useState } from 'react';
-import { Box, Text, useInput } from 'ink';
+import { Box, Text } from 'ink';
+import { isSafeToReplayIntoApproval, useBufferedInput } from '../input-buffer.js';
 import { useTheme } from '../context.js';
 import { DiffView } from './DiffView.js';
 import type { PermissionChoice, PermissionRequest } from '../../permissions/manager.js';
@@ -56,7 +57,7 @@ export function PermissionPrompt({
     forceRender();
   };
 
-  useInput((input, key) => {
+  useBufferedInput((input, key) => {
     // Editing mode: capture the instruction, then hand it back as a rejection
     // that tells the model what to do instead.
     const current = instruction.current;
@@ -126,7 +127,8 @@ export function PermissionPrompt({
       // not rebuilding the change from nothing.
       setPicker({ cursor: 0, accepted: new Set(hunks.map((h) => h.index)) });
     } else if (value === 'd' && request.preview) setShowPreview((v) => !v);
-  });
+    // Live input does anything; a replayed keystroke may only deny.
+  }, { acceptReplay: isSafeToReplayIntoApproval });
 
   const editing = instruction.current;
   const reviewing = picker.current;

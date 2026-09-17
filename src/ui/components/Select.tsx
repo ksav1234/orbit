@@ -1,5 +1,6 @@
 import React, { useMemo, useReducer, useRef } from 'react';
-import { Box, Text, useInput } from 'ink';
+import { Box, Text } from 'ink';
+import { useBufferedInput } from '../input-buffer.js';
 import { useTheme } from '../context.js';
 import { truncateWidth } from '../../util/format.js';
 
@@ -67,7 +68,7 @@ export function SelectPrompt<T>({
   const clamp = (value: number): number =>
     visible.length === 0 ? 0 : Math.max(0, Math.min(value, visible.length - 1));
 
-  useInput((input, key) => {
+  useBufferedInput((input, key) => {
     if (key.escape) {
       onCancel();
       return;
@@ -224,7 +225,7 @@ export function SecretPrompt({
   const [, forceRender] = useReducer((n: number) => n + 1, 0);
   const value = useRef('');
 
-  useInput((input, key) => {
+  useBufferedInput((input, key) => {
     if (key.escape) {
       onCancel();
       return;

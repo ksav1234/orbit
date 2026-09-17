@@ -34,6 +34,8 @@ import {
   type DiscoveredPrice,
 } from './context/pricing.js';
 import { HookRunner, describeHook, hookMatchesTool } from './hooks/runner.js';
+import { checksFor, isOwnSource, verifyConfigFor } from './agent/verify.js';
+import { LessonStore } from './agent/lessons.js';
 import {
   WindowCache,
   describeWindowSource,
@@ -82,6 +84,8 @@ const COMMANDS = new Set([
   'hooks',
   'pricing',
   'failover',
+  'verify',
+  'lessons',
   'provider',
   'model',
   'web',
@@ -186,6 +190,8 @@ function showHelp(): void {
   print('  orbit hooks [test <n>]       Lifecycle hooks: list them, or try one out');
   print('  orbit pricing <cmd>          list | import | set <key> <in> <out> | clear');
   print('  orbit failover <cmd>         list | add <id> | remove <id> | off');
+  print('  orbit verify [on|off]        Check its own work after a turn, and fix what broke');
+  print('  orbit lessons <cmd>          What it remembers here: add <text> | forget <n> | clear');
   print('  orbit model context [<n>]    Show, resize (up/down/+50k), or re-detect the window');
   print();
   print(ui.title('Options'));
@@ -955,6 +961,7 @@ async function startInteractive(options: StartOptions): Promise<number> {
     checkpoints,
     background,
     webApiKey: webKey,
+    explicitVerifyKeys: config.explicitKeys('verify'),
     resolveWindow: windowFor,
     detectWindow: detectWindowFor,
     hooks,
@@ -1020,6 +1027,21 @@ async function startInteractive(options: StartOptions): Promise<number> {
   for (const issue of config.validationIssues()) {
     warnings.push(
       `Config section "${issue.section}" was unusable and is running on defaults (${issue.message}).`,
+    );
+  }
+
+  // Said once, only when it would actually do something here, and only while
+  // it is off — a setting nobody can find is a setting nobody uses.
+  const verifySettings = verifyConfigFor(
+    config.get().verify,
+    workspace,
+    config.explicitKeys('verify'),
+  );
+  if (!verifySettings.enabled && checksFor(verifySettings, workspace).length > 0) {
+    warnings.push(
+      `Orbit can check its own work here (${checksFor(verifySettings, workspace)
+        .map((check) => check.command)
+        .join(', ')}) and fix what breaks. Turn it on with: orbit verify on`,
     );
   }
 
@@ -1556,6 +1578,120 @@ async function failoverCommand(config: ConfigManager, args: string[]): Promise<n
   return 1;
 }
 
+/** Turn self-verification on or off, and show what it would run. */
+async function verifyCommand(config: ConfigManager, args: string[]): Promise<number> {
+  const [action] = args;
+  const current = config.get().verify;
+
+  if (action === 'on' || action === 'off') {
+    await config.update((draft) => {
+      draft.verify.enabled = action === 'on';
+    });
+    // Turning it off is a choice even in Orbit's own source, where it would
+    // otherwise default back on.
+    config.markExplicit('verify.enabled');
+    print(ui.ok(`Self-verification ${action === 'on' ? 'enabled' : 'disabled'}.`));
+    return 0;
+  }
+
+  const workspace = await detectWorkspace(process.cwd());
+  const effective = verifyConfigFor(current, workspace, config.explicitKeys('verify'));
+  const checks = checksFor(effective, workspace);
+
+  print();
+  print(ui.title('Self-verification'));
+  print();
+  print(`  ${ui.label('Enabled')}   ${ui.value(effective.enabled ? 'yes' : 'no')}`);
+  print(`  ${ui.label('Attempts')}  ${ui.value(String(effective.maxRounds))}`);
+  print(
+    `  ${ui.label('On failure')} ${ui.value(effective.rollbackOnFailure ? 'undo the turn' : 'keep the change')}`,
+  );
+  print();
+
+  if (checks.length === 0) {
+    print(ui.dim('  Nothing to verify with here — no typecheck, build or test command found.'));
+    print(ui.dim('  Name one yourself in config under verify.commands.'));
+  } else {
+    print(ui.dim('  Would run, in order:'));
+    for (const check of checks) print(`    ${ui.value(check.command)}   ${ui.dim(check.label)}`);
+  }
+
+  if (isOwnSource(workspace)) {
+    print();
+    print(ui.dim('  This is Orbit own source, so verification and rollback default to on:'));
+    print(ui.dim('  a broken change here breaks the tool you would use to fix it.'));
+  }
+
+  print();
+  print(ui.dim('  orbit verify on    check the work after every turn that changes files'));
+  print(ui.dim('  orbit verify off'));
+  print();
+  return 0;
+}
+
+/** Inspect what Orbit has been told to remember about this workspace. */
+async function lessonsCommand(args: string[]): Promise<number> {
+  const [action, ...rest] = args;
+  const store = LessonStore.create(process.cwd());
+  await store.load();
+
+  if (action === 'add') {
+    const text = rest.join(' ').trim();
+    if (!text) {
+      printError(ui.error('Usage: orbit lessons add <what to remember>'));
+      return 1;
+    }
+    store.add(text, 'manual');
+    await store.save();
+    print(ui.ok(`Remembered: ${text}`));
+    return 0;
+  }
+
+  if (action === 'forget') {
+    const removed = store.remove(Number.parseInt(rest[0] ?? '', 10));
+    await store.save();
+    if (!removed) {
+      printError(ui.error(`No lesson ${rest[0] ?? ''}. Run: orbit lessons`));
+      return 1;
+    }
+    print(ui.ok(`Forgot: ${removed.text}`));
+    return 0;
+  }
+
+  if (action === 'clear') {
+    const count = store.clear();
+    await store.save();
+    print(ui.ok(`Forgot ${pluralize(count, 'lesson')}.`));
+    return 0;
+  }
+
+  const lessons = store.list();
+  print();
+  print(ui.title(`Lessons  ${ui.dim(tildify(process.cwd()))}`));
+  print();
+  if (lessons.length === 0) {
+    print(ui.dim('  Nothing remembered for this workspace yet.'));
+    print();
+    print(ui.dim('  When you reject an operation and say what you wanted instead, that'));
+    print(ui.dim('  instruction is kept and applied in later sessions here.'));
+    print();
+    print(ui.dim('  orbit lessons add <text>     remember something now'));
+    print();
+    return 0;
+  }
+
+  lessons.forEach((lesson, index) => {
+    print(`  ${String(index + 1).padStart(2)}. ${ui.value(lesson.text)}`);
+    const origin = lesson.source === 'correction' ? 'from a correction' : 'added by you';
+    print(`      ${ui.dim(`${origin}${lesson.about ? ` while: ${lesson.about}` : ''}`)}`);
+  });
+  print();
+  print(ui.dim(`  Stored in ${tildify(LessonStore.fileFor(process.cwd()))}, never in your project.`));
+  print(ui.dim('  orbit lessons forget <n>   ·   orbit lessons clear'));
+  print();
+  return 0;
+}
+
 function reportStartupError(error: unknown): void {
   if (error instanceof OrbitError) {
     printError('');
@@ -1665,6 +1801,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return pricingCommand(config, positional);
     case 'failover':
       return failoverCommand(config, positional);
+    case 'verify':
+      return verifyCommand(config, positional);
+    case 'lessons':
+      return lessonsCommand(positional);
     case 'mcp':
       return mcpCommand(config, positional);
     case 'sessions':

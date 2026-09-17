@@ -285,6 +285,64 @@ next one to the window that is left:
 - the stable prefix (system prompt + tool schemas) is marked for **prompt
   caching** where the provider supports it, and cache hits show up in `/usage`.
 
+### Long sessions keep what you told them
+
+When the conversation outgrows the window, Orbit compacts it: old tool output is
+shrunk first, then older turns are folded into a written summary. A summary
+records what *happened* — it does not reliably carry forward what it was *told*.
+"Never touch anything under `generated/`", said once at the start, is exactly the
+kind of standing instruction that gets paraphrased into nothing, and the agent
+then breaks it and looks like it forgot.
+
+So your own messages travel through compaction **word-for-word**, alongside the
+summary:
+
+```
+[Summary of earlier conversation, generated automatically to free context space]
+
+We renamed several modules and fixed the build.
+
+[Your earlier instructions, kept word-for-word. These are still in force
+unless something later in this conversation overrides them.]
+
+1. Never touch anything under generated/. It is all machine-written.
+2. Use tabs in this repo, not spaces.
+```
+
+They are kept newest-first inside `agent.keepInstructionTokens` (1,500 by
+default), because a later instruction usually supersedes an earlier one — so if
+anything has to be dropped it should be the oldest, and the summary still covers
+it. A single enormous paste is quoted in part rather than in full. Set the budget
+to 0 to summarise everything instead.
+
+Project-level instructions in `ORBIT.md`, `AGENTS.md` or `CLAUDE.md` live in the
+system prompt and were never subject to this — they are always in force.
+
+### A steady terminal while streaming
+
+Ink updates its live region by moving the cursor up and rewriting those lines.
+That works only while the region is shorter than the window: once it is taller,
+it clears the **whole screen** on every update instead, and the redraw is visible
+as flicker. Measured on a 30-row terminal streaming a long reply:
+
+| Live region | Full-screen clears | Terminal writes |
+| --- | --- | --- |
+| unclipped | 54 | 403 KB |
+| clipped to the window | **0** | **42 KB** |
+
+So a streaming reply shows its tail — the part being written — with a count of
+what has scrolled past:
+
+```
+… 120 earlier lines above
+the reply continues here, still being written▌
+```
+
+Nothing is lost: the complete text is committed to scrollback the moment the turn
+ends. The clip is row-aware rather than line-aware, because a long line wraps and
+costs several rows of the window; counting lines would still overflow, and still
+flicker.
+
 ### What each request costs
 
 Every model request prints what it actually used, from the provider's own
@@ -638,6 +696,113 @@ the model to open a page with `web_fetch` before treating anything as
 authoritative.
 
 Set `TAVILY_API_KEY` and Orbit will use that instead of the stored key.
+
+## Checking its own work
+
+Orbit can run your project's real checks after a turn that changed files, hand
+itself the failures, and fix them — before giving the turn back to you:
+
+```
+› add retry logic to the client
+
+  ✎ edited src/client.ts
+  Verifying: npm run typecheck
+  Verifying: npm run test
+  ✗ 2 failing: timeout not cleared on retry
+  ✎ edited src/client.ts
+  Verified after 2 rounds: typecheck, test passed in 6.4s.
+```
+
+```bash
+orbit verify        # what it would run here, and whether it is on
+orbit verify on
+```
+
+The evidence is real command output, not the model's opinion of its own work.
+The checks come from your project — a `typecheck`, `build` or `test` script, or
+`cargo check`, `go test`, `pytest` — with the cheapest useful signal first,
+because a type error is found in seconds and makes a test run pointless anyway.
+A dev server or a deploy script is never run unprompted. Name your own with
+`verify.commands`.
+
+Three things keep it from becoming a token sink:
+
+- **It stops at the first failure.** Once the type-check is red, the test output
+  is noise rather than information.
+- **It stops when it stops making progress.** Identical failures two rounds
+  running mean the last attempt changed nothing that mattered, so another round
+  would spend a request to reach the same place. Line numbers are ignored when
+  comparing — shifting by one is not progress.
+- **A missing check is not a failure.** If the command is not installed, the
+  shell says so, and Orbit reports that nothing was verified rather than asking
+  the model to fix a binary it cannot install — which would invite it to edit
+  the check instead.
+
+Off by default: it runs commands on your machine and spends tokens doing it.
+`verify.rollbackOnFailure` additionally undoes the turn when the checks never
+pass, leaving the workspace as it was rather than half-fixed.
+
+## Keystrokes typed a moment too early
+
+Ink dispatches input through an event emitter with no replay, and a handler
+subscribes in an effect — which runs *after* the frame announcing the prompt is
+already on screen. So there is a window where the prompt is visible, the
+previous handler has unsubscribed, and the new one has not yet subscribed.
+Anything typed then went to nobody. You saw a prompt that ignored you.
+
+Orbit now watches stdin for the whole session and hands anything caught in that
+window to the handler that appears next. Keystrokes older than half a second are
+dropped rather than replayed — by then you have seen the prompt and will type
+again, and a key arriving from nowhere is worse than one that was missed.
+
+**A replayed keystroke can never approve anything.** Into an approval prompt,
+only a denial or a cancel is replayed; `y` and `a` are ignored and must be typed
+live. Replaying a buffered approval would authorise an operation you never read,
+which is the one thing the permission system exists to prevent.
+
+## What it remembers about you
+
+Corrections are kept and applied in later sessions. Two things trigger one:
+rejecting an operation and saying what you wanted instead, and simply telling
+Orbit a rule in passing — "no, never edit the lockfile by hand", "from now on
+prefer async/await". The second is how a rule usually arrives.
+
+The test is narrow on purpose: the message has to generalise. "No, fix that typo
+on line 4" is about this moment and is not kept; capturing everything corrective
+would fill the prompt with noise, which is worse than capturing nothing.
+
+```
+› /lessons
+
+  1. Use make deploy, never npm publish      (from a correction)
+  2. Tabs, not spaces, in this repo
+```
+
+```bash
+orbit lessons                  # what it remembers here
+orbit lessons add "<text>"
+orbit lessons forget 2
+```
+
+Kept **per workspace**, because advice about one repository is usually wrong
+about another, and stored under `~/.orbit` rather than written into your
+project. Repeating a lesson folds into the existing entry instead of stacking
+up, and the newest survive the 50-entry cap. They go into the system prompt as
+context you *can* override — the live conversation always wins, and Orbit is
+told to say so if one conflicts with what you are asking now.
+
+Turn it off with `agent.rememberLessons: false`.
+
+## When Orbit edits Orbit
+
+Working on the source of the program that is running is the one case where a
+broken change is not merely inconvenient: the next launch may not start, and the
+tool you would use to fix it is the tool that is broken.
+
+So when the workspace is Orbit itself — recognised by its package name, so a
+clone or fork under any path counts — verification and rollback default to
+**on**. A setting you chose yourself is never overridden; this only fills in the
+safer default where you never said.
 
 ## Lifecycle hooks
 

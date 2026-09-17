@@ -37,6 +37,14 @@ import { UsageTracker } from '../context/usage.js';
 import { describeWindowSource, type WindowResolution, type WindowSource } from '../context/window.js';
 import type { HookPayload, HookRunner } from '../hooks/runner.js';
 import { ShellSession } from '../tools/shell-session.js';
+import {
+  checksFor,
+  failureReport,
+  runChecks,
+  successSummary,
+  verifyConfigFor,
+} from './verify.js';
+import { LessonStore, looksLikeStandingCorrection } from './lessons.js';
 import { OrbitError } from '../util/errors.js';
 import { buildSystemPrompt, PROJECT_INSTRUCTION_FILES } from './prompts.js';
 
@@ -77,6 +85,11 @@ export interface AgentOptions {
    * a slow provider never delays the switch itself.
    */
   detectWindow?: (provider: AIProvider, model: string) => Promise<WindowResolution | undefined>;
+  /**
+   * Verify settings the user set explicitly, so Orbit's safer defaults for its
+   * own source never override a deliberate choice.
+   */
+  explicitVerifyKeys?: ReadonlySet<string>;
   /** User lifecycle hooks. Omit to run without any. */
   hooks?: HookRunner;
   /**
@@ -180,6 +193,13 @@ export class Agent {
   private readonly shellSession: ShellSession;
   /** Who the session started with, to return to after a failover. */
   private readonly primary: { provider: AIProvider; model: string; label: string };
+  /** What this workspace has taught Orbit in earlier sessions. */
+  private lessons: LessonStore | undefined;
+
+  /** Set when verification gave up and the turn should be undone. */
+  private rollbackRequested = false;
+  /** Whether this turn ran anything that could have changed the workspace. */
+  private turnChangedFiles = false;
   private projectInstructions = '';
   private running = false;
 
@@ -211,6 +231,7 @@ export class Agent {
     this.context = new ContextManager({
       contextWindow: window.tokens,
       compactThreshold: options.config.agent.compactThreshold,
+      instructionTokens: options.config.agent.keepInstructionTokens,
       responseReserve: responseReserveFor(window.tokens, options.config.agent.maxTokens),
     });
 
@@ -226,7 +247,37 @@ export class Agent {
   /** Load project instruction files and build the initial system prompt. */
   async initialize(): Promise<void> {
     this.projectInstructions = await this.readProjectInstructions();
+
+    if (this.options.config.agent.rememberLessons) {
+      this.lessons = LessonStore.create(this.options.sandbox.root);
+      await this.lessons.load();
+    }
+
     this.refreshSystemPrompt();
+  }
+
+  /** The lesson store, for the `/lessons` command and the CLI. */
+  get lessonStore(): LessonStore | undefined {
+    return this.lessons;
+  }
+
+  /**
+   * Remember something for next time.
+   *
+   * Called when you reject an operation and say what you wanted instead — that
+   * sentence is a rule, not a request, and it is the one most worth keeping.
+   */
+  async rememberLesson(
+    text: string,
+    source: 'manual' | 'correction',
+    about?: string,
+  ): Promise<boolean> {
+    if (!this.lessons) return false;
+    const lesson = this.lessons.add(text, source, about);
+    if (!lesson) return false;
+    await this.lessons.save();
+    this.refreshSystemPrompt();
+    return true;
   }
 
   get sessionRecord(): SessionRecord {
@@ -300,6 +351,110 @@ export class Agent {
       this.applyContextWindow(found);
     } catch {
       // Detection is an optimisation. The name-based window still works.
+    }
+  }
+
+  // ── verification ─────────────────────────────────────────────────────────
+
+  /**
+   * Run the project's own checks against what the turn just changed, and give
+   * the model its failures to fix.
+   *
+   * The evidence is real command output, not the model's opinion of its work —
+   * which is the difference between this and asking it "are you sure?". Each
+   * round costs a request, so it stops at the configured limit, and stops early
+   * when two rounds produce identical failures: that means the last attempt
+   * changed nothing that mattered and another will reach the same place.
+   */
+  private async verifyAndRepair(
+    initial: TurnResult,
+    loop: AgentLoop,
+    signal: AbortSignal,
+  ): Promise<TurnResult> {
+    // Editing Orbit's own source gets verification and rollback whether or not
+    // they were configured: a broken change there breaks the tool needed to fix
+    // it.
+    const config = verifyConfigFor(
+      this.options.config.verify,
+      this.options.workspace,
+      this.options.explicitVerifyKeys,
+    );
+    if (!config.enabled || initial.reason !== 'complete') return initial;
+
+    if (config.onlyOnChange && !this.turnChangedFiles) return initial;
+
+    const checks = checksFor(config, this.options.workspace);
+    if (checks.length === 0) {
+      log.debug('nothing to verify with in this workspace');
+      return initial;
+    }
+
+    let result = initial;
+    let previousSignature = '';
+
+    for (let round = 1; round <= config.maxRounds + 1; round++) {
+      if (signal.aborted) return result;
+
+      const outcome = await runChecks({
+        checks,
+        cwd: this.options.sandbox.root,
+        timeoutMs: config.timeoutMs,
+        maxOutputChars: this.options.config.tools.maxOutputChars,
+        signal,
+        onProgress: (check) =>
+          this.emit({ type: 'notice', message: `Verifying: ${check.command}` }),
+      });
+
+      if (!outcome.ran) return result;
+      if (outcome.passed) {
+        this.emit({ type: 'notice', message: successSummary(outcome, round) });
+        return result;
+      }
+
+      if (outcome.signature === previousSignature) {
+        this.emit({
+          type: 'notice',
+          message: 'The same failure came back unchanged — stopping rather than trying again.',
+        });
+        break;
+      }
+      previousSignature = outcome.signature;
+
+      if (round > config.maxRounds) break;
+
+      this.context.addSystemNote(failureReport(outcome, round, config.maxRounds));
+      result = await loop.run(signal);
+      if (result.reason !== 'complete') return result;
+    }
+
+    this.emit({
+      type: 'notice',
+      message: 'Checks are still failing. Look at the change before relying on it.',
+    });
+
+    // The rollback itself happens after the turn's checkpoint is committed —
+    // until then there is nothing recorded to undo.
+    this.rollbackRequested = config.rollbackOnFailure;
+    return result;
+  }
+
+  /**
+   * Undo a turn whose checks never passed, once its checkpoint exists.
+   *
+   * Leaves the workspace as it was rather than half-fixed, which is the point
+   * of asking for it. Off by default: a partly-working change is often still
+   * worth having and looking at.
+   */
+  private async rollbackIfRequested(): Promise<void> {
+    if (!this.rollbackRequested) return;
+    this.rollbackRequested = false;
+
+    const undone = await this.options.checkpoints?.undoLast();
+    if (undone) {
+      this.emit({
+        type: 'notice',
+        message: `Rolled the turn back: ${undone.result.restored.length} file(s) restored.`,
+      });
     }
   }
 
@@ -485,6 +640,7 @@ export class Agent {
         visionAvailable: this.visionAvailable,
         fallbackToolProtocol: !this.toolsAvailable,
         projectInstructions: this.projectInstructions,
+        lessons: this.lessons?.render(this.options.config.agent.lessonTokens),
       }),
     );
   }
@@ -508,9 +664,17 @@ export class Agent {
     }
 
     this.running = true;
+    this.turnChangedFiles = false;
     this.controller = new AbortController();
 
     try {
+      // A standing rule stated in passing is still a standing rule, and it is
+      // the commonest way one arrives. Narrow on purpose: "no, fix that typo" is
+      // about this moment, not a rule worth carrying into next week.
+      if (looksLikeStandingCorrection(input)) {
+        void this.rememberLesson(input, 'correction').catch(() => {});
+      }
+
       const content: ContentPart[] = [{ type: 'text', text: input }, ...attachments];
       this.context.addUserMessage(attachments.length > 0 ? content : input);
 
@@ -563,7 +727,11 @@ export class Agent {
 
       await this.runHooks('turn-start', { turn: this.turnNumber() });
 
-      const result = await loop.run(this.controller.signal);
+      let result = await loop.run(this.controller.signal);
+
+      // Check the work, and let the model fix what it broke, before the turn is
+      // handed back. Runs only when something was actually changed.
+      result = await this.verifyAndRepair(result, loop, this.controller.signal);
 
       await this.runHooks('turn-end', {
         turn: this.turnNumber(),
@@ -576,6 +744,8 @@ export class Agent {
       if (checkpoint) {
         this.emit({ type: 'checkpoint', turn: checkpoint.turn, files: checkpoint.files.length });
       }
+
+      await this.rollbackIfRequested();
 
       await this.persist();
       return result;
@@ -614,6 +784,13 @@ export class Agent {
       ok: result.ok,
       summary: result.display.summary,
     });
+
+    // Tracked here rather than read off the checkpoint manager, which reports
+    // nothing when checkpointing is switched off — and verification would then
+    // silently never run.
+    if (result.ok && this.options.registry.get(name)?.readOnly === false) {
+      this.turnChangedFiles = true;
+    }
   }
 
   private createToolContext(

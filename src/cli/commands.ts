@@ -963,6 +963,70 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     },
   },
   {
+    name: 'lessons',
+    description: 'What Orbit has been told to remember in this workspace',
+    usage: '[add <text> | forget <n> | clear]',
+    async run(args, context) {
+      const store = context.agent.lessonStore;
+      if (!store) {
+        context.notice('Remembering lessons is switched off (agent.rememberLessons).', 'warning');
+        return;
+      }
+
+      const [verb, ...rest] = args.trim().split(/" + B + B + "s+/);
+      const remainder = rest.join(' ').trim();
+
+      if (verb === 'add' && remainder) {
+        await context.agent.rememberLesson(remainder, 'manual');
+        context.notice(`Remembered: ${remainder}`, 'success');
+        return;
+      }
+      if (verb === 'forget' && remainder) {
+        const removed = store.remove(Number.parseInt(remainder, 10));
+        await store.save();
+        context.notice(
+          removed ? `Forgot: ${removed.text}` : `No lesson ${remainder}.`,
+          removed ? 'success' : 'warning',
+        );
+        return;
+      }
+      if (verb === 'clear') {
+        const count = store.clear();
+        await store.save();
+        context.notice(`Forgot ${pluralize(count, 'lesson')}.`, 'success');
+        return;
+      }
+
+      const lessons = store.list();
+      if (lessons.length === 0) {
+        context.print(
+          [
+            '**Lessons**',
+            '',
+            'Nothing remembered for this workspace yet. When you reject an operation',
+            'and say what you wanted instead, that instruction is kept. You can also',
+            'add one directly with `/lessons add <text>`.',
+          ].join('" + B + "n'),
+        );
+        return;
+      }
+
+      const rows = lessons.map(
+        (lesson, index) =>
+          `  ${String(index + 1).padStart(2)}. ${lesson.text}${lesson.source === 'correction' ? '   (from a correction)' : ''}`,
+      );
+      context.print(
+        [
+          `**Lessons** — ${pluralize(lessons.length, 'thing')} remembered here`,
+          '```',
+          ...rows,
+          '```',
+          '_Forget one with_ `/lessons forget <n>`_, all with_ `/lessons clear`_._',
+        ].join('" + B + "n'),
+      );
+    },
+  },
+  {
     name: 'hooks',
     description: 'Show the lifecycle hooks that are running this session',
     run(_args, context) {

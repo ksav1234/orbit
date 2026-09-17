@@ -193,3 +193,41 @@ describe('loading a damaged config through the manager', () => {
     expect(backups).toEqual([]);
   });
 });
+
+describe('knowing what the user chose deliberately', () => {
+  it('reports the keys actually written in the file', async () => {
+    await writeConfig({
+      version: 1,
+      providers: { good: goodProvider },
+      verify: { enabled: false },
+    });
+
+    const manager = new ConfigManager();
+    await manager.load();
+
+    expect([...manager.explicitKeys('verify')]).toEqual(['enabled']);
+    expect([...manager.explicitKeys('ui')]).toEqual([]);
+  });
+
+  // The case diffing cannot see: `orbit verify off` writes false, which is also
+  // the schema default, yet it is unmistakably a choice.
+  it('records a choice that happens to match the default', async () => {
+    const manager = new ConfigManager();
+    await manager.load();
+
+    await manager.update((draft) => {
+      draft.verify.enabled = false;
+    });
+    expect([...manager.explicitKeys('verify')]).toEqual([]);
+
+    manager.markExplicit('verify.enabled');
+    expect([...manager.explicitKeys('verify')]).toContain('enabled');
+  });
+
+  it('ignores malformed paths rather than throwing', async () => {
+    const manager = new ConfigManager();
+    await manager.load();
+    expect(() => manager.markExplicit('nokey', '', 'a.b.c')).not.toThrow();
+    expect([...manager.explicitKeys('a')]).toContain('b');
+  });
+});

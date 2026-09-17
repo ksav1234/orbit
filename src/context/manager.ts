@@ -13,6 +13,8 @@ const log = createLogger('context');
 
 export interface ContextManagerOptions {
   contextWindow: number;
+  /** Budget for user instructions preserved verbatim through compaction. */
+  instructionTokens?: number;
   /** Tokens held back for the model's reply. */
   responseReserve?: number;
   /** Fraction of the window that triggers compaction. */
@@ -27,6 +29,8 @@ export type CompactionEvent =
   | { type: 'finished'; before: number; after: number };
 
 export interface CompactOptions {
+  /** Budget for carrying user instructions through verbatim. */
+  instructionTokens?: number;
   tools: ToolDefinition[];
   summarizer?: Summarizer;
   signal?: AbortSignal;
@@ -40,7 +44,7 @@ export interface CompactOptions {
  * The agent loop asks for messages; this class decides what fits.
  */
 export class ContextManager {
-  private entries: ContextEntry[] = [];
+  private entryList: ContextEntry[] = [];
   private systemPrompt: string;
   private window: number;
   private reserve: number;
@@ -51,6 +55,8 @@ export class ContextManager {
    * rather than leaving a large model permanently squeezed.
    */
   private configuredReserve: number;
+  /** How much room to give the user's own words when history is summarised. */
+  private readonly instructionTokens: number;
 
   constructor(options: ContextManagerOptions) {
     this.window = options.contextWindow;
@@ -58,6 +64,7 @@ export class ContextManager {
       options.responseReserve ?? Math.min(8192, Math.floor(options.contextWindow * 0.15));
     this.reserve = this.reserveFor(options.contextWindow);
     this.threshold = options.compactThreshold ?? 0.82;
+    this.instructionTokens = options.instructionTokens ?? 1_500;
     this.systemPrompt = options.systemPrompt ?? '';
   }
 
@@ -91,14 +98,15 @@ export class ContextManager {
     return this.window;
   }
 
-  private push(message: Message): ContextEntry {
+  private push(message: Message, flags: { generated?: boolean } = {}): ContextEntry {
     const entry: ContextEntry = {
       id: shortId(),
       message,
       tokens: estimateMessageTokens(message),
       timestamp: new Date().toISOString(),
+      ...(flags.generated ? { generated: true } : {}),
     };
-    this.entries.push(entry);
+    this.entryList.push(entry);
     return entry;
   }
 
@@ -137,40 +145,47 @@ export class ContextManager {
 
   /** A note the model should see, e.g. a denied permission or a cancellation. */
   addSystemNote(text: string): ContextEntry {
-    return this.push({ role: 'user', content: `[Orbit] ${text}` });
+    // Marked as generated: it travels on the user role because that is the only
+    // channel available mid-conversation, but it is not something the user said.
+    return this.push({ role: 'user', content: `[Orbit] ${text}` }, { generated: true });
   }
 
   messages(): Message[] {
     const messages: Message[] = [];
     if (this.systemPrompt) messages.push({ role: 'system', content: this.systemPrompt });
-    for (const entry of this.entries) messages.push(entry.message);
+    for (const entry of this.entryList) messages.push(entry.message);
     return messages;
   }
 
   /** Conversation without the system prompt, for session persistence. */
   history(): ContextEntry[] {
-    return this.entries;
+    return this.entryList;
+  }
+
+  /** The raw entries, for persistence and for compaction to reason about. */
+  entries(): readonly ContextEntry[] {
+    return this.entryList;
   }
 
   restore(entries: ContextEntry[]): void {
-    this.entries = entries.map((entry) => ({
+    this.entryList = entries.map((entry) => ({
       ...entry,
       tokens: entry.tokens || estimateMessageTokens(entry.message),
     }));
   }
 
   clear(): void {
-    this.entries = [];
+    this.entryList = [];
   }
 
   get length(): number {
-    return this.entries.length;
+    return this.entryList.length;
   }
 
   budget(tools: ToolDefinition[] = []): Budget {
     return computeBudget({
       systemPrompt: this.systemPrompt,
-      messages: this.entries.map((entry) => entry.message),
+      messages: this.entryList.map((entry) => entry.message),
       tools,
       responseReserve: this.reserve,
       contextWindow: this.window,
@@ -190,11 +205,11 @@ export class ContextManager {
     if (!options.force && before.ratio < this.threshold) return before;
 
     options.onEvent?.({ type: 'started', ratio: before.ratio });
-    log.info('compacting context', { ratio: before.ratio, entries: this.entries.length });
+    log.info('compacting context', { ratio: before.ratio, entries: this.entryList.length });
 
-    const compressed = compressToolResults(this.entries, { keepRecent: 6 });
+    const compressed = compressToolResults(this.entryList, { keepRecent: 6 });
     if (compressed.savedTokens > 0) {
-      this.entries = compressed.entries;
+      this.entryList = compressed.entries;
       options.onEvent?.({
         type: 'compressed-tools',
         count: compressed.compressedCount,
@@ -204,13 +219,14 @@ export class ContextManager {
 
     let current = this.budget(options.tools);
     if (current.ratio >= this.threshold * 0.95) {
-      const summarized = await summarizeOlderTurns(this.entries, {
+      const summarized = await summarizeOlderTurns(this.entryList, {
         keepRecent: 8,
         summarizer: options.summarizer,
         signal: options.signal,
+        instructionTokens: options.instructionTokens ?? this.instructionTokens,
       });
       if (summarized.summary !== null) {
-        this.entries = summarized.entries;
+        this.entryList = summarized.entries;
         options.onEvent?.({
           type: 'summarized',
           removed: summarized.removedCount,
@@ -232,8 +248,8 @@ export class ContextManager {
   enforceHardLimit(tools: ToolDefinition[] = []): boolean {
     let trimmed = false;
     let guard = 0;
-    while (this.budget(tools).available <= 0 && this.entries.length > 2 && guard++ < 100) {
-      this.entries.shift();
+    while (this.budget(tools).available <= 0 && this.entryList.length > 2 && guard++ < 100) {
+      this.entryList.shift();
       trimmed = true;
     }
     if (trimmed) log.warn('hard context limit reached; oldest messages dropped');

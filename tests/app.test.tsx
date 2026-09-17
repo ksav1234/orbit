@@ -723,10 +723,19 @@ describe('Orbit app', () => {
     expect(frame).toContain('mock-model-mini');
     expect(frame).toContain('current');
 
-    instance.stdin.write(DOWN); // down arrow
-    instance.stdin.write(ENTER);
+    // Move the cursor onto the second entry, confirming it landed there before
+    // committing. An arrow key is not idempotent, so this checks the highlight
+    // rather than re-sending blind — the keystroke can be dropped in the gap
+    // between the frame appearing and Ink attaching its input handler.
+    const cursorOnMini = (): boolean => {
+      const lines = stripAnsi(instance.lastFrame() ?? '').split('\n');
+      return lines.some((line) => line.includes('→') && line.includes('mock-model-mini'));
+    };
+    await pressUntil(instance, DOWN, cursorOnMini);
 
-    await waitFor(() => output().includes('Model switched to mock-model-mini'));
+    await pressUntil(instance, ENTER, () =>
+      output().includes('Model switched to mock-model-mini'),
+    );
     expect(agent.model).toBe('mock-model-mini');
 
     instance.unmount();
@@ -823,8 +832,11 @@ describe('Orbit app', () => {
     await waitFor(() => stripAnsi(instance.lastFrame() ?? '').includes('ORBIT') ||
       stripAnsi(instance.lastFrame() ?? '').includes('█'));
 
+    // The placeholder disappears as soon as anything is typed, so waiting on it
+    // would depend on exactly one keystroke landing. The session header is
+    // stable once the intro is over.
     await pressUntil(instance, ' ', () =>
-      stripAnsi(instance.lastFrame() ?? '').includes('What would you like to build?'),
+      stripAnsi(instance.lastFrame() ?? '').includes('Workspace'),
     );
 
     instance.unmount();

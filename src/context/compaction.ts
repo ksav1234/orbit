@@ -8,6 +8,15 @@ export interface ContextEntry {
   tokens: number;
   /** Entries added by compaction, so they are not compacted again. */
   synthetic?: boolean;
+  /**
+   * Written by Orbit rather than typed by the user.
+   *
+   * They use the user role because that is the only channel a mid-conversation
+   * note can travel on, but they are not instructions — quoting a stale
+   * verification failure back as a standing rule would be both wasteful and
+   * misleading.
+   */
+  generated?: boolean;
   /** Tool results already reduced in size. */
   compressed?: boolean;
   timestamp: string;
@@ -71,6 +80,11 @@ export interface SummarizeOptions {
   keepRecent?: number;
   summarizer?: Summarizer;
   signal?: AbortSignal;
+  /**
+   * Budget for user instructions carried through the summary word-for-word.
+   * Set to 0 to summarise everything, which is what the agent used to do.
+   */
+  instructionTokens?: number;
 }
 
 export interface SummarizeResult {
@@ -78,6 +92,60 @@ export interface SummarizeResult {
   summary: string | null;
   removedCount: number;
   savedTokens: number;
+}
+
+/** Text of a message, whatever shape its content takes. */
+function messageText(message: Message): string {
+  if (typeof message.content === 'string') return message.content;
+  return message.content
+    .map((part) => (part.type === 'text' ? part.text : ''))
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * The user's own words, pulled out of the turns about to be summarised.
+ *
+ * A summariser writes down what *happened*; it does not reliably carry forward
+ * what it was *told*. "Never touch the generated files", said once at the start
+ * of a long session, is exactly the kind of standing instruction that gets
+ * paraphrased into nothing — and the agent then breaks it and looks like it
+ * forgot. So the instructions travel verbatim alongside the summary.
+ *
+ * Newest first within the budget: a later instruction usually supersedes an
+ * earlier one, so if something has to be dropped it should be the oldest.
+ */
+export function preservedInstructions(
+  entries: ContextEntry[],
+  maxTokens: number,
+): { kept: string[]; droppedCount: number } {
+  if (maxTokens <= 0) return { kept: [], droppedCount: 0 };
+
+  const candidates = entries.filter(
+    (entry) => entry.message.role === 'user' && !entry.synthetic && !entry.generated,
+  );
+
+  const kept: string[] = [];
+  let used = 0;
+  let dropped = 0;
+
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const text = messageText(candidates[i]!.message).trim();
+    if (!text) continue;
+
+    // A single enormous paste is not an instruction worth quoting in full.
+    const clipped = text.length > 2_000 ? `${text.slice(0, 2_000)}…` : text;
+    const cost = estimateTokens(clipped) + 4;
+
+    if (used + cost > maxTokens) {
+      dropped += 1;
+      continue;
+    }
+    kept.unshift(clipped);
+    used += cost;
+  }
+
+  return { kept, droppedCount: dropped };
 }
 
 /**
@@ -115,9 +183,35 @@ export async function summarizeOlderTurns(
     summary = outlineTranscript(older);
   }
 
+  // The summary says what happened; these say what was asked for. Losing the
+  // second is what makes a long session look like the agent forgot.
+  const instructions = preservedInstructions(older, options.instructionTokens ?? 1_500);
+
+  const sections = [
+    '[Summary of earlier conversation, generated automatically to free context space]',
+    '',
+    summary,
+  ];
+
+  if (instructions.kept.length > 0) {
+    sections.push(
+      '',
+      '[Your earlier instructions, kept word-for-word. These are still in force',
+      'unless something later in this conversation overrides them.]',
+      '',
+      ...instructions.kept.map((text, index) => `${index + 1}. ${text}`),
+    );
+    if (instructions.droppedCount > 0) {
+      sections.push(
+        '',
+        `(${instructions.droppedCount} older message(s) are covered by the summary above rather than quoted.)`,
+      );
+    }
+  }
+
   const summaryMessage: Message = {
     role: 'user',
-    content: `[Summary of earlier conversation, generated automatically to free context space]\n\n${summary}`,
+    content: sections.join('\n'),
   };
   const summaryEntry: ContextEntry = {
     id: `summary-${Date.now().toString(36)}`,

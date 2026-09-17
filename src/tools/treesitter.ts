@@ -68,6 +68,10 @@ const QUERIES: Record<string, string[]> = {
     '(generator_function_declaration name: (identifier) @function)',
     '(method_definition name: (property_identifier) @method)',
     '(public_field_definition name: (property_identifier) @const)',
+    // `#name` is a distinct node type, so it needs its own pattern or private
+    // fields simply vanish from the outline.
+    '(public_field_definition name: (private_property_identifier) @const)',
+    '(method_definition name: (private_property_identifier) @method)',
     '(interface_declaration name: (type_identifier) @interface)',
     '(type_alias_declaration name: (type_identifier) @type)',
     '(enum_declaration name: (identifier) @enum)',

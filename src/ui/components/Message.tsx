@@ -37,18 +37,30 @@ export interface AssistantMessageProps {
   columns: number;
   /** Streaming messages get a trailing cursor. */
   streaming?: boolean;
+  /**
+   * Lines scrolled out of the live view while streaming. Shown as a count so
+   * the reply does not appear to have started mid-sentence; the whole text
+   * lands in scrollback when the turn ends.
+   */
+  hiddenLines?: number;
 }
 
 export function AssistantMessage({
   text,
   columns,
   streaming = false,
+  hiddenLines = 0,
 }: AssistantMessageProps): React.ReactElement | null {
   const theme = useTheme();
   if (!text.trim() && !streaming) return null;
 
   return (
     <Box flexDirection="column" marginBottom={streaming ? 0 : 1}>
+      {hiddenLines > 0 && (
+        <Text color={theme.colors.muted} dimColor>
+          {`… ${hiddenLines} earlier line${hiddenLines === 1 ? '' : 's'} above`}
+        </Text>
+      )}
       <Markdown text={text} columns={columns} />
       {streaming && <Text color={theme.colors.muted}>{theme.symbols.pending}</Text>}
     </Box>
